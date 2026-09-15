@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0d0d0e">
+  <title>Court Router</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="shell-header">
+    <a class="brand" href="#overview" aria-label="Court Router overview">Court Router</a>
+    <nav class="nav" aria-label="Dashboard sections">
+      <button class="nav-button active" data-view="overview">Overview</button>
+      <button class="nav-button" data-view="manage">Manage</button>
+      <button class="nav-button" data-view="logs">Logs</button>
+      <button class="nav-button" data-view="settings">Settings</button>
+    </nav>
+  </header>
+  <main>
+    <section class="view" id="view-overview">
+      <div class="title-row"><h1>Account pools</h1><div class="updated" id="updated">Updating quotas...</div><button class="icon-button refresh" id="refresh" aria-label="Refresh quotas"><svg aria-hidden="true"><use href="/assets/ui.svg#refresh"/></svg></button></div>
+      <div class="status-line"><div id="gateway"><strong>Checking gateway</strong><span class="separator">·</span> Reading local accounts</div><button class="text-button" data-view="manage">Manage subscriptions <span aria-hidden="true">↗</span></button></div>
+      <section class="codex-switch" aria-labelledby="codex-app-title"><div class="switch-copy"><span class="provider-mark provider-Codex"><img src="/assets/openai.svg" alt=""></span><div><b id="codex-app-title">Codex App</b><small id="codex-mode-copy">Checking connection mode...</small></div></div><div class="switch-actions" role="group" aria-label="Codex model source"><button class="mode-button" data-mode="court">Use Court models</button><button class="mode-button" data-mode="normal">Restore ChatGPT</button></div></section>
+      <section class="pools" id="pools" aria-label="Provider summaries"></section>
+      <div class="toolbar"><div class="filters" id="filters" role="group" aria-label="Filter accounts"></div><div class="allowance-label">Allowance remaining</div></div>
+      <section class="cards" id="accounts" aria-live="polite"></section>
+    </section>
+    <section class="view" id="view-manage" hidden><div class="page-head"><div><h1>Manage accounts</h1><p>OAuth providers are built in. Custom OpenAI-compatible APIs stay on this Mac.</p></div></div><div class="section-label"><span>Authentication providers</span><span id="provider-count"></span></div><div class="provider-list" id="provider-list"></div></section>
+    <section class="view" id="view-logs" hidden><div class="page-head"><div><h1>Logs</h1><p>Recent local service and sign-in activity. Court redacts common credentials before display.</p></div></div><div class="log-panel"><div class="log-toolbar"><span>Local activity</span><button class="secondary-button" id="refresh-logs">Refresh</button></div><pre id="log-output">Loading logs...</pre></div></section>
+    <section class="view" id="view-settings" hidden><div class="page-head"><div><h1>Settings</h1><p>Browser preferences and local service details.</p></div></div><div class="settings-layout"><section class="settings-card" aria-label="Preferences"><div class="setting-row"><div><b>Automatic refresh</b><span>How often Court checks quotas</span></div><select id="refresh-rate"><option value="15">Every 15 seconds</option><option value="30">Every 30 seconds</option><option value="60">Every minute</option><option value="300">Every 5 minutes</option></select></div><div class="setting-row"><div><b>Time format</b><span>Used across the dashboard</span></div><strong>12-hour</strong></div><div class="setting-row"><div><b>Network access</b><span>Bound to this computer only</span></div><span class="status-pill good"><i></i>Loopback only</span></div></section><aside class="privacy-card"><svg aria-hidden="true"><use href="/assets/ui.svg#shield"/></svg><h2>Local by design</h2><p>Account files and API keys never appear in page source or API responses. Provider keys live in a mode 600 file outside this repository.</p><code id="local-address">127.0.0.1</code></aside></div></section>
+  </main>
+  <dialog id="endpoint-dialog"><div class="modal-head"><div><span class="modal-kicker">Custom provider</span><h2>Add OpenAI-compatible API</h2></div><button class="close-modal icon-button" type="button" aria-label="Close"><svg aria-hidden="true"><use href="/assets/ui.svg#close"/></svg></button></div><form class="endpoint-form" id="endpoint-form"><label class="field">Provider name<input name="name" maxlength="60" placeholder="OpenCode Go" required></label><label class="field">Base URL<input name="baseUrl" type="url" placeholder="https://example.com/v1" required></label><label class="field">API key<input name="apiKey" type="password" autocomplete="new-password" placeholder="Enter API key" required></label><div class="form-result" id="form-result">Court tests the provider's <code>/models</code> endpoint before saving.</div><div class="modal-actions"><button class="secondary-button cancel-modal" type="button">Cancel</button><button class="primary-button" type="submit">Test and add</button></div></form></dialog>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

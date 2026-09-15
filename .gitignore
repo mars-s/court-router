@@ -1,0 +1,16 @@
+.DS_Store
+*.log
+*.pid
+.env
+.env.*
+!.env.example
+node_modules/
+coverage/
+dist/
+*.bak
+*.key
+*.pem
+*.p12
+*.pfx
+*.mobileprovision
+court-security-report.json

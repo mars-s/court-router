@@ -1,0 +1,48 @@
+#!/bin/zsh
+set -euo pipefail
+
+ROOT="${0:A:h}"
+COURT_STATE_DIR="${COURT_STATE_DIR:-$HOME/.local/state/court}"
+COURT_PORT="${COURT_PORT:-8477}"
+PIDFILE="$COURT_STATE_DIR/court.pid"
+LOGFILE="$COURT_STATE_DIR/court.log"
+URL="http://127.0.0.1:$COURT_PORT"
+
+mkdir -p "$COURT_STATE_DIR"
+
+running() {
+  [[ -f "$PIDFILE" ]] && kill -0 "$(<"$PIDFILE")" 2>/dev/null
+}
+
+case "${1:-help}" in
+  up)
+    if running; then echo "Court is already running at $URL"; exit 0; fi
+    rm -f "$PIDFILE"
+    COURT_STATE_DIR="$COURT_STATE_DIR" COURT_PORT="$COURT_PORT" /usr/bin/env node "$ROOT/server.mjs" --daemon > "$PIDFILE" 2>> "$LOGFILE"
+    sleep 1
+    if running; then echo "Court is up at $URL"; else echo "Court failed to start; see $LOGFILE"; exit 1; fi
+    ;;
+  down)
+    if running; then kill "$(<"$PIDFILE")"; rm -f "$PIDFILE"; echo "Court is down"; else rm -f "$PIDFILE"; echo "Court is not running"; fi
+    ;;
+  status)
+    if running; then echo "Court is up at $URL"; else echo "Court is down"; fi
+    ;;
+  open)
+    open "$URL"
+    ;;
+  connect)
+    case "${2:-}" in
+      codex) exec CLIProxyAPI --codex-login ;;
+      claude) exec CLIProxyAPI --claude-login ;;
+      antigravity) exec CLIProxyAPI --antigravity-login ;;
+      grok) exec CLIProxyAPI --xai-login ;;
+      kimi) exec CLIProxyAPI --kimi-login ;;
+      *) echo "Usage: court connect {codex|claude|antigravity|grok|kimi}"; exit 2 ;;
+    esac
+    ;;
+  *)
+    echo "Court, a local Router account dashboard"
+    echo "Usage: court {up|down|status|open|connect <codex|claude|antigravity|grok|kimi>}"
+    ;;
+esac

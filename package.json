@@ -1,0 +1,15 @@
+{
+  "name": "court-router",
+  "version": "0.1.0",
+  "private": false,
+  "description": "A local dashboard for CLIProxyAPI accounts, quotas, and Codex routing.",
+  "type": "module",
+  "bin": { "court": "./court" },
+  "scripts": {
+    "start": "node server.mjs",
+    "check": "node --check server.mjs && node --check public/app.js",
+    "security": "node scripts/security-check.mjs"
+  },
+  "engines": { "node": ">=20" },
+  "license": "MIT"
+}
