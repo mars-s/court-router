@@ -375,10 +375,13 @@ const server = http.createServer(async (req, res) => {
       const name = String(input.name || '').trim();
       const prefix = String(input.prefix || name).trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-');
       const apiKey = String(input.apiKey || '').trim();
+      const modelId = String(input.modelId || '').trim();
       const baseUrl = cleanBaseUrl(input.baseUrl);
       if (!name || !prefix || !apiKey) throw new Error('Name, base URL, and API key are required');
-      if (name.length > 60 || prefix.length > 60 || apiKey.length > 8192) throw new Error('Provider details are too long');
-      const models = await discoverModels(baseUrl, apiKey);
+      if (name.length > 60 || prefix.length > 60 || modelId.length > 200 || apiKey.length > 8192) throw new Error('Provider details are too long');
+      const discovered = await discoverModels(baseUrl, apiKey);
+      if (modelId && !discovered.includes(modelId)) throw new Error(`The provider did not return model ${modelId}`);
+      const models = modelId ? [modelId] : discovered;
       const providers = await readCustomProviders();
       const entry = { name, prefix, baseUrl, apiKey, models, updatedAt: new Date().toISOString() };
       const index = providers.findIndex((provider) => provider.prefix === prefix);

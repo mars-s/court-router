@@ -100,11 +100,22 @@ function renderManage() {
     return `<article class="provider-connect ${providerClass(name)}"><h2>${mark(name)}${safe(name)}</h2><div class="connect-state">${count ? `${plural(count, 'account')} connected` : 'No accounts connected yet'}</div><button class="connect-button" data-connect="${id}">${count ? 'Add another account' : 'Connect account'}</button></article>`;
   }).join('');
   const custom = customProviders.map((provider) => `<article class="provider-connect custom-provider provider-Codex"><h2><span class="provider-mark">API</span>${safe(provider.name)}</h2><div class="connect-state">${plural(provider.models.length, 'model')} · ${safe(provider.keyHint)}<br><code>${safe(provider.prefix)}/...</code></div><button class="remove-provider" data-remove="${safe(provider.prefix)}">Remove</button></article>`).join('');
-  qs('#provider-list').innerHTML = `${oauth}${custom}<button class="add-provider" id="add-provider"><div><span aria-hidden="true">+</span>Add custom OpenAI API</div></button>`;
+  qs('#provider-list').innerHTML = `${oauth}${custom}<button class="add-provider" id="add-union-alpha"><div><span aria-hidden="true">+</span>Add Union Alpha</div></button><button class="add-provider" id="add-provider"><div><span aria-hidden="true">+</span>Add custom OpenAI API</div></button>`;
   qs('#provider-count').textContent = plural(connectProviders.length + customProviders.length, 'provider');
   qsa('[data-connect]').forEach((button) => button.addEventListener('click', () => connect(button)));
   qsa('[data-remove]').forEach((button) => button.addEventListener('click', () => removeProvider(button.dataset.remove)));
   qs('#add-provider').addEventListener('click', () => qs('#endpoint-dialog').showModal());
+  qs('#add-union-alpha').addEventListener('click', () => {
+    const form = qs('#endpoint-form');
+    form.reset();
+    form.elements.name.value = 'OpenRouter Union Alpha';
+    form.elements.baseUrl.value = 'https://openrouter.ai/api/v1';
+    form.elements.modelId.value = 'stealth/union-alpha';
+    qs('#form-result').className = 'form-result';
+    qs('#form-result').innerHTML = 'Enter an OpenRouter key. Court will add only <code>stealth/union-alpha</code>.';
+    qs('#endpoint-dialog').showModal();
+    form.elements.apiKey.focus();
+  });
 }
 
 function showToast(message) {
