@@ -1,6 +1,6 @@
 # Court Router
 
-Court is a localhost dashboard for [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI). It shows connected OAuth accounts, model availability, quota windows, reset times, and custom OpenAI-compatible endpoints. It can also restart the Codex desktop app against the local router or restore the normal ChatGPT connection.
+Court is a localhost dashboard for [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI). It shows connected OAuth accounts, model availability, quota windows, reset times, and custom OpenAI-compatible endpoints. It can also restart the Codex desktop app against the local router, launch it directly with Gemini 3.8 Flash from a connected Antigravity pool, or restore the normal ChatGPT connection.
 
 Court is local administration software. It is not affiliated with OpenAI, Anthropic, Google, xAI, Moonshot AI, or the OpenCode project.
 
@@ -35,6 +35,10 @@ Google**. Gemini CLI OAuth is separate from CLIProxyAPI in current 7.3.x
 releases, so Court reports the account but does not claim its models are routed
 into Codex. Google AI Studio keys and Vertex service accounts use separate API
 quotas.
+
+If `gemini-3.8-flash-high` is available through a connected Antigravity account,
+the Overview page offers a dedicated **Use Gemini 3.8 Flash** button. This is an
+Antigravity-backed router mode; it does not reuse Gemini CLI credentials.
 
 ## Configuration
 

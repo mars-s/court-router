@@ -182,13 +182,17 @@ async function loadCodexMode() {
   try {
     const response = await fetch('/api/codex-mode');
     const { mode } = await response.json();
-    qs('#codex-mode-copy').textContent = mode === 'court' ? 'Using Court Router and its model pool' : 'Using your normal ChatGPT account';
+    qs('#codex-mode-copy').textContent = mode === 'gemini'
+      ? 'Using Gemini 3.8 Flash through your Antigravity pool'
+      : mode === 'court'
+        ? 'Using Court Router and its model pool'
+        : 'Using your normal ChatGPT account';
     qsa('[data-mode]').forEach((button) => button.classList.toggle('active', button.dataset.mode === mode));
   } catch { qs('#codex-mode-copy').textContent = 'Could not read Codex configuration'; }
 }
 
 async function changeCodexMode(mode) {
-  const label = mode === 'court' ? 'Court models' : 'your normal ChatGPT account';
+  const label = mode === 'gemini' ? 'Gemini 3.8 Flash' : mode === 'court' ? 'Court models' : 'your normal ChatGPT account';
   if (!confirm(`Restart the Codex App using ${label}? Any running tasks will be interrupted.`)) return;
   qsa('[data-mode]').forEach((button) => { button.disabled = true; });
   try {

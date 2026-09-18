@@ -19,6 +19,7 @@ const AUTH_LOG = path.join(STATE_DIR, 'auth.log');
 const CUSTOM_PROVIDERS = process.env.COURT_PROVIDERS_FILE || path.join(STATE_DIR, 'providers.json');
 const LEGACY_CUSTOM_PROVIDERS = path.join(HOME, '.court-providers.json');
 const CODEX_CONFIG = process.env.COURT_CODEX_CONFIG || path.join(HOME, '.codex', 'config.toml');
+const CODEX_MODE_STATE = path.join(STATE_DIR, 'codex-mode.json');
 const GEMINI_CREDENTIALS = process.env.COURT_GEMINI_CREDENTIALS || path.join(HOME, '.gemini', 'oauth_creds.json');
 const MAX_BODY_BYTES = 32 * 1024;
 const quotaCache = new Map();
@@ -297,15 +298,31 @@ async function writeRouterProviders(providers) {
 
 async function codexMode() {
   const config = await fs.readFile(CODEX_CONFIG, 'utf8').catch(() => '');
-  return /model_provider\s*=\s*["']cliproxyapi["']/.test(config) ? 'court' : 'normal';
+  if (!/model_provider\s*=\s*["']cliproxyapi["']/.test(config)) return 'normal';
+  return /^model\s*=\s*["']gemini-3\.8-flash-high["']/m.test(config) ? 'gemini' : 'court';
 }
 
 async function setCodexMode(mode) {
   let config = await fs.readFile(CODEX_CONFIG, 'utf8');
+  const previousMode = await codexMode();
   await fs.copyFile(CODEX_CONFIG, `${CODEX_CONFIG}.${Math.floor(Date.now() / 1000)}.bak`);
+  if (mode !== 'normal' && previousMode === 'normal') {
+    const model = config.match(/^model\s*=\s*(["'][^"']*["'])/m)?.[1] || null;
+    await fs.writeFile(CODEX_MODE_STATE, JSON.stringify({ model }), { mode: 0o600 });
+  }
   const providerBlock = /\n?\[model_providers\.cliproxyapi\]\n[\s\S]*?(?=\n\[|$)/;
   config = config.replace(/^model_provider\s*=.*\n/m, '').replace(providerBlock, '\n');
-  if (mode === 'court') {
+  if (mode === 'normal') {
+    try {
+      const saved = JSON.parse(await fs.readFile(CODEX_MODE_STATE, 'utf8'));
+      if (saved.model) config = config.replace(/^model\s*=.*$/m, `model = ${saved.model}`);
+      await fs.unlink(CODEX_MODE_STATE);
+    } catch {}
+  } else {
+    if (mode === 'gemini') {
+      if (/^model\s*=/m.test(config)) config = config.replace(/^model\s*=.*$/m, 'model = "gemini-3.8-flash-high"');
+      else config = `model = "gemini-3.8-flash-high"\n${config}`;
+    }
     const firstLineEnd = config.indexOf('\n') + 1;
     config = `${config.slice(0, firstLineEnd)}model_provider = "cliproxyapi"\n${config.slice(firstLineEnd).replace(/^\n+/, '')}`;
     config = `${config.trimEnd()}\n\n[model_providers.cliproxyapi]\nname = "Court Router"\nbase_url = "${ROUTER_URL}/v1"\nenv_key = "CLIPROXYAPI_API_KEY"\nwire_api = "responses"\n`;
@@ -317,7 +334,7 @@ function restartChatGPT(mode) {
   const quit = spawn('osascript', ['-e', 'tell application "ChatGPT" to quit'], { stdio: 'ignore' });
   quit.once('exit', () => setTimeout(async () => {
     const env = { ...process.env };
-    if (mode === 'court') env.CLIPROXYAPI_API_KEY = await apiKey();
+    if (mode !== 'normal') env.CLIPROXYAPI_API_KEY = await apiKey();
     else delete env.CLIPROXYAPI_API_KEY;
     for (const key of ['PYTHONHOME', 'PYTHONPATH', 'PYTHONDONTWRITEBYTECODE']) delete env[key];
     const launcher = spawn('/Applications/ChatGPT.app/Contents/Resources/codex', ['app'], {
@@ -335,13 +352,15 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === '/api/codex-mode' && req.method === 'POST') {
     try {
       const mode = (await readJsonBody(req)).mode;
-      if (!['court', 'normal'].includes(mode)) throw new Error('Unknown Codex mode');
-      if (mode === 'court') {
+      if (!['court', 'gemini', 'normal'].includes(mode)) throw new Error('Unknown Codex mode');
+      if (mode !== 'normal') {
         const router = await routerModels();
         if (!router.online) throw new Error('Router is offline. Start it before launching Codex.');
+        if (mode === 'gemini' && !router.models.includes('gemini-3.8-flash-high')) throw new Error('Gemini 3.8 Flash is not available in the current router pool.');
       }
       await setCodexMode(mode);
-      json(res, { ok: true, mode, message: mode === 'court' ? 'Restarting Codex with Court models.' : 'Restoring your normal ChatGPT account.' });
+      const message = mode === 'gemini' ? 'Restarting Codex with Gemini 3.8 Flash.' : mode === 'court' ? 'Restarting Codex with Court models.' : 'Restoring your normal ChatGPT account.';
+      json(res, { ok: true, mode, message });
       setTimeout(() => restartChatGPT(mode), 700);
       return;
     } catch (error) { return json(res, { error: error.message }, 400); }
