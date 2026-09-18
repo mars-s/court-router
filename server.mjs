@@ -300,7 +300,10 @@ async function writeRouterProviders(providers) {
     '    api-key-entries:',
     `      - api-key: ${JSON.stringify(provider.apiKey)}`,
     '    models:',
-    ...provider.models.flatMap((model) => [`      - name: ${JSON.stringify(model)}`, `        alias: ${JSON.stringify(model)}`])
+    ...provider.models.flatMap((model) => [
+      `      - name: ${JSON.stringify(model)}`,
+      `        alias: ${JSON.stringify(model === 'unbiased/pareto' ? 'union-alpha' : model)}`
+    ])
   ]), end].join('\n') : '';
   const managed = new RegExp(`${start}[\\s\\S]*?${end}`);
   if (!managed.test(current) && /^openai-compatibility:\s*$/m.test(current)) throw new Error('Router already has a manually managed openai-compatibility section');
