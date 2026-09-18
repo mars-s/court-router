@@ -12,3 +12,7 @@ See `docs/logo-sources.md` for the exact sources and usage notes.
 
 CLIProxyAPI's MIT license is available at:
 https://github.com/router-for-me/CLIProxyAPI/blob/main/LICENSE
+
+The Google Gemini SVG is from Simple Icons, which publishes its icon set under
+CC0 1.0. Google Gemini remains a trademark of Google. Source:
+https://github.com/simple-icons/simple-icons/blob/develop/icons/googlegemini.svg

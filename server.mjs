@@ -19,6 +19,7 @@ const AUTH_LOG = path.join(STATE_DIR, 'auth.log');
 const CUSTOM_PROVIDERS = process.env.COURT_PROVIDERS_FILE || path.join(STATE_DIR, 'providers.json');
 const LEGACY_CUSTOM_PROVIDERS = path.join(HOME, '.court-providers.json');
 const CODEX_CONFIG = process.env.COURT_CODEX_CONFIG || path.join(HOME, '.codex', 'config.toml');
+const GEMINI_CREDENTIALS = process.env.COURT_GEMINI_CREDENTIALS || path.join(HOME, '.gemini', 'oauth_creds.json');
 const MAX_BODY_BYTES = 32 * 1024;
 const quotaCache = new Map();
 
@@ -81,9 +82,36 @@ function providerFor(filename, data) {
   if (name.startsWith('codex-') || type.includes('codex') || type.includes('openai')) return 'Codex';
   if (name.startsWith('claude-') || type.includes('claude')) return 'Claude';
   if (name.startsWith('antigravity-') || type.includes('antigravity')) return 'Antigravity';
+  if (name.startsWith('gemini-') || type === 'gemini' || type === 'gemini-cli') return 'Gemini';
   if (name.startsWith('xai-') || type.includes('grok')) return 'Grok';
   if (name.startsWith('kimi-') || type.includes('kimi')) return 'Kimi';
   return 'Other';
+}
+
+async function executablePath(name) {
+  const candidates = [
+    path.join(HOME, '.local', 'bin', name),
+    path.join('/opt/homebrew/bin', name),
+    path.join('/usr/local/bin', name),
+    ...String(process.env.PATH || '').split(path.delimiter).map((directory) => path.join(directory, name))
+  ];
+  for (const candidate of [...new Set(candidates)]) {
+    try { await fs.access(candidate); return candidate; } catch {}
+  }
+  return null;
+}
+
+async function geminiCliStatus() {
+  const binary = await executablePath('gemini');
+  let credential = null;
+  try { credential = JSON.parse(await fs.readFile(GEMINI_CREDENTIALS, 'utf8')); } catch {}
+  const claims = jwtPayload(credential?.id_token || '');
+  return {
+    installed: Boolean(binary),
+    signedIn: Boolean(credential?.access_token || credential?.refresh_token || credential?.id_token),
+    accountLabel: claims.email || null,
+    routerSupported: false
+  };
 }
 
 function planFor(filename) {
@@ -139,7 +167,8 @@ async function routerModels() {
     const response = await fetch(`${ROUTER_URL}/v1/models`, { headers: { authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(2500) });
     if (!response.ok) return { online: false, models: [], error: `Router returned ${response.status}` };
     const body = await response.json();
-    return { online: true, models: (body.data || []).map((model) => model.id).sort() };
+    const modelDetails = (body.data || []).map((model) => ({ id: model.id, ownedBy: model.owned_by || null })).sort((a, b) => a.id.localeCompare(b.id));
+    return { online: true, models: modelDetails.map((model) => model.id), modelDetails };
   } catch {
     return { online: false, models: [], error: 'Router is not running' };
   }
@@ -173,11 +202,20 @@ async function accounts() {
       };
     } catch { return null; }
   }));
-  return rows.filter(Boolean).sort((a, b) => a.provider.localeCompare(b.provider) || a.label.localeCompare(b.label));
+  const filtered = rows.filter(Boolean);
+  const gemini = await geminiCliStatus();
+  if (gemini.signedIn) {
+    filtered.push({
+      id: 'gemini-cli', provider: 'Gemini', label: gemini.accountLabel || 'Gemini CLI Google account',
+      plan: 'Google sign-in', disabled: false, expired: false, updatedAt: new Date().toISOString(),
+      quotaUsed: null, quotaRemaining: null, windowSeconds: null, resetAt: null, bankedResets: null, activeRequests: 0
+    });
+  }
+  return filtered.sort((a, b) => a.provider.localeCompare(b.provider) || a.label.localeCompare(b.label));
 }
 
 async function overview() {
-  const [router, accountRows] = await Promise.all([routerModels(), accounts()]);
+  const [router, accountRows, geminiCli] = await Promise.all([routerModels(), accounts(), geminiCliStatus()]);
   const providers = Object.values(accountRows.reduce((all, account) => {
     const group = all[account.provider] ||= { name: account.provider, accounts: [], models: [] };
     group.accounts.push(account);
@@ -187,13 +225,15 @@ async function overview() {
     provider.models = router.models.filter((model) => {
       if (provider.name === 'Codex') return /^gpt|^codex/i.test(model);
       if (provider.name === 'Claude') return /^claude/i.test(model);
-      if (provider.name === 'Antigravity') return /gemini|antigravity/i.test(model);
+      const owner = router.modelDetails?.find((detail) => detail.id === model)?.ownedBy;
+      if (provider.name === 'Antigravity') return owner === 'antigravity' || (!owner && /antigravity/i.test(model));
+      if (provider.name === 'Gemini') return owner === 'gemini';
       if (provider.name === 'Grok') return /grok/i.test(model);
       if (provider.name === 'Kimi') return /kimi/i.test(model);
       return false;
     });
   }
-  return { generatedAt: new Date().toISOString(), router, providers, accounts: accountRows };
+  return { generatedAt: new Date().toISOString(), router, providers, accounts: accountRows, integrations: { geminiCli } };
 }
 
 async function readCustomProviders() {
@@ -351,6 +391,14 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === '/api/connect' && req.method === 'POST') {
     let provider;
     try { provider = (await readJsonBody(req)).provider; } catch { return json(res, { error: 'Invalid request' }, 400); }
+    if (provider === 'gemini') {
+      const binary = await executablePath('gemini');
+      if (!binary) return json(res, { error: 'Gemini CLI is not installed. Install @google/gemini-cli first.' }, 409);
+      const command = binary.replace(/["\\]/g, '\\$&');
+      const terminal = spawn('osascript', ['-e', `tell application "Terminal" to do script "${command}"`], { detached: true, stdio: 'ignore' });
+      terminal.unref();
+      return json(res, { ok: true, message: 'Gemini CLI opened in Terminal. Choose Sign in with Google.' }, 202);
+    }
     const flags = { codex: '--codex-login', claude: '--claude-login', antigravity: '--antigravity-login', grok: '--xai-login', kimi: '--kimi-login' };
     if (!flags[provider]) return json(res, { error: 'Unsupported provider' }, 400);
     if (provider === 'antigravity') {

@@ -1,7 +1,7 @@
-const providerOrder = ['Codex', 'Claude', 'Grok', 'Antigravity', 'Kimi'];
-const providerStyles = { Codex: '#58aef3', Claude: '#e99a5c', Grok: '#65c990', Antigravity: '#ad91f7', Kimi: '#63c7c7' };
-const providerAssets = { Codex: 'openai.svg', Claude: 'claude.svg', Grok: 'xai.svg', Antigravity: 'antigravity.svg', Kimi: 'kimi.svg' };
-const connectProviders = [['codex', 'Codex'], ['claude', 'Claude'], ['antigravity', 'Antigravity'], ['grok', 'Grok'], ['kimi', 'Kimi']];
+const providerOrder = ['Codex', 'Claude', 'Grok', 'Gemini', 'Antigravity', 'Kimi'];
+const providerStyles = { Codex: '#58aef3', Claude: '#e99a5c', Grok: '#65c990', Gemini: '#78a6ff', Antigravity: '#ad91f7', Kimi: '#63c7c7' };
+const providerAssets = { Codex: 'openai.svg', Claude: 'claude.svg', Grok: 'xai.svg', Gemini: 'gemini.svg', Antigravity: 'antigravity.svg', Kimi: 'kimi.svg' };
+const connectProviders = [['codex', 'Codex'], ['claude', 'Claude'], ['gemini', 'Gemini'], ['antigravity', 'Antigravity'], ['grok', 'Grok'], ['kimi', 'Kimi']];
 
 let data = null;
 let filter = 'All pools';
@@ -54,7 +54,7 @@ function accountCard(account) {
 
 function renderOverview() {
   const connected = data.providers.map((provider) => provider.name);
-  const pools = [...providerOrder.filter((name) => connected.includes(name)), ...providerOrder.filter((name) => !connected.includes(name))].slice(0, 3);
+  const pools = [...providerOrder.filter((name) => connected.includes(name)), ...providerOrder.filter((name) => !connected.includes(name))];
   qs('#pools').innerHTML = pools.map(summaryPool).join('');
   const available = ['All pools', ...providerOrder.filter((name) => connected.includes(name))];
   qs('#filters').innerHTML = available.map((name) => `<button class="filter ${filter === name ? 'active' : ''}" data-filter="${name}" aria-pressed="${filter === name}">${name === 'All pools' ? '' : `<i class="filter-dot" style="--dot:${providerStyles[name]}"></i>`}${name}</button>`).join('');
@@ -89,6 +89,14 @@ function renderManage() {
   if (!data) return;
   const oauth = connectProviders.map(([id, name]) => {
     const count = data.accounts.filter((account) => account.provider === name).length;
+    if (name === 'Gemini') {
+      const status = data.integrations?.geminiCli || {};
+      const state = status.signedIn
+        ? 'Google account connected to Gemini CLI'
+        : status.installed ? 'Gemini CLI installed, not signed in' : 'Gemini CLI is not installed';
+      const note = '<span class="provider-note">CLI only. Router import is not supported yet.</span>';
+      return `<article class="provider-connect ${providerClass(name)}"><h2>${mark(name)}Gemini CLI</h2><div class="connect-state">${state}${note}</div><button class="connect-button" data-connect="${id}" ${status.installed ? '' : 'disabled'}>${status.signedIn ? 'Open Gemini CLI' : status.installed ? 'Sign in with Google' : 'Not installed'}</button></article>`;
+    }
     return `<article class="provider-connect ${providerClass(name)}"><h2>${mark(name)}${safe(name)}</h2><div class="connect-state">${count ? `${plural(count, 'account')} connected` : 'No accounts connected yet'}</div><button class="connect-button" data-connect="${id}">${count ? 'Add another account' : 'Connect account'}</button></article>`;
   }).join('');
   const custom = customProviders.map((provider) => `<article class="provider-connect custom-provider provider-Codex"><h2><span class="provider-mark">API</span>${safe(provider.name)}</h2><div class="connect-state">${plural(provider.models.length, 'model')} · ${safe(provider.keyHint)}<br><code>${safe(provider.prefix)}/...</code></div><button class="remove-provider" data-remove="${safe(provider.prefix)}">Remove</button></article>`).join('');

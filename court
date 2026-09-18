@@ -36,13 +36,14 @@ case "${1:-help}" in
       codex) exec CLIProxyAPI --codex-login ;;
       claude) exec CLIProxyAPI --claude-login ;;
       antigravity) exec CLIProxyAPI --antigravity-login ;;
+      gemini) exec gemini ;;
       grok) exec CLIProxyAPI --xai-login ;;
       kimi) exec CLIProxyAPI --kimi-login ;;
-      *) echo "Usage: court connect {codex|claude|antigravity|grok|kimi}"; exit 2 ;;
+      *) echo "Usage: court connect {codex|claude|antigravity|gemini|grok|kimi}"; exit 2 ;;
     esac
     ;;
   *)
     echo "Court, a local Router account dashboard"
-    echo "Usage: court {up|down|status|open|connect <codex|claude|antigravity|grok|kimi>}"
+    echo "Usage: court {up|down|status|open|connect <codex|claude|antigravity|gemini|grok|kimi>}"
     ;;
 esac

@@ -10,6 +10,7 @@ Court is local administration software. It is not affiliated with OpenAI, Anthro
 - Node.js 20 or newer
 - CLIProxyAPI installed and configured
 - The Codex desktop app, only if you want the Codex routing toggle
+- Gemini CLI, only if you want Google sign-in and Gemini CLI status in Court
 
 ## Install
 
@@ -28,6 +29,12 @@ court open
 ```
 
 Stop it with `court down`. Use `court status` to check it.
+
+Connect Gemini CLI with `court connect gemini`, then choose **Sign in with
+Google**. Gemini CLI OAuth is separate from CLIProxyAPI in current 7.3.x
+releases, so Court reports the account but does not claim its models are routed
+into Codex. Google AI Studio keys and Vertex service accounts use separate API
+quotas.
 
 ## Configuration
 
