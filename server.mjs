@@ -273,6 +273,18 @@ async function discoverModels(baseUrl, apiKey) {
   return [...new Set(models)].slice(0, 2000).sort();
 }
 
+async function validateRequestedModel(baseUrl, apiKey, modelId, discovered) {
+  if (discovered.includes(modelId)) return;
+  const url = new URL(baseUrl);
+  if (url.hostname !== 'openrouter.ai') throw new Error(`The provider did not return model ${modelId}`);
+  const response = await fetch(`${baseUrl}/models/${modelId}/endpoints`, {
+    headers: { authorization: `Bearer ${apiKey}` },
+    signal: AbortSignal.timeout(8000)
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok || body.data?.id !== modelId) throw new Error(`OpenRouter did not confirm model ${modelId}`);
+}
+
 async function writeRouterProviders(providers) {
   const current = await fs.readFile(CONFIG, 'utf8');
   const start = '# >>> COURT CUSTOM PROVIDERS';
@@ -380,7 +392,7 @@ const server = http.createServer(async (req, res) => {
       if (!name || !prefix || !apiKey) throw new Error('Name, base URL, and API key are required');
       if (name.length > 60 || prefix.length > 60 || modelId.length > 200 || apiKey.length > 8192) throw new Error('Provider details are too long');
       const discovered = await discoverModels(baseUrl, apiKey);
-      if (modelId && !discovered.includes(modelId)) throw new Error(`The provider did not return model ${modelId}`);
+      if (modelId) await validateRequestedModel(baseUrl, apiKey, modelId, discovered);
       const models = modelId ? [modelId] : discovered;
       const providers = await readCustomProviders();
       const entry = { name, prefix, baseUrl, apiKey, models, updatedAt: new Date().toISOString() };
