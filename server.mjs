@@ -3,7 +3,12 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
+import { Readable } from 'node:stream';
+import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
+import { restartMacChatGPT } from './lib/macos-app-launch.mjs';
+import { filterVerifiedModels, toCodexCatalog } from './lib/model-catalog.mjs';
+import { ResponseHistory, ResponseEventReader } from './lib/response-history.mjs';
 
 const PORT = Number.parseInt(process.env.COURT_PORT || '8477', 10);
 const HOST = '127.0.0.1';
@@ -13,6 +18,7 @@ const STATE_DIR = process.env.COURT_STATE_DIR || path.join(HOME, '.local', 'stat
 const AUTH_DIR = process.env.COURT_AUTH_DIR || path.join(HOME, '.cli-proxy-api');
 const CONFIG = process.env.COURT_ROUTER_CONFIG || '/opt/homebrew/etc/cliproxyapi.conf';
 const ROUTER_URL = process.env.COURT_ROUTER_URL || 'http://127.0.0.1:8317';
+const COURT_API_URL = `http://${HOST}:${PORT}/v1`;
 const PUBLIC = path.join(ROOT, 'public');
 const COURT_LOG = path.join(STATE_DIR, 'court.log');
 const AUTH_LOG = path.join(STATE_DIR, 'auth.log');
@@ -20,9 +26,12 @@ const CUSTOM_PROVIDERS = process.env.COURT_PROVIDERS_FILE || path.join(STATE_DIR
 const LEGACY_CUSTOM_PROVIDERS = path.join(HOME, '.court-providers.json');
 const CODEX_CONFIG = process.env.COURT_CODEX_CONFIG || path.join(HOME, '.codex', 'config.toml');
 const CODEX_MODE_STATE = path.join(STATE_DIR, 'codex-mode.json');
+const CODEX_MODEL_CATALOG = path.join(STATE_DIR, 'codex-model-catalog.json');
 const GEMINI_CREDENTIALS = process.env.COURT_GEMINI_CREDENTIALS || path.join(HOME, '.gemini', 'oauth_creds.json');
 const MAX_BODY_BYTES = 32 * 1024;
+const MAX_PROXY_BODY_BYTES = 32 * 1024 * 1024;
 const quotaCache = new Map();
+const responseHistory = new ResponseHistory(path.join(STATE_DIR, 'response-history'));
 
 if (!Number.isInteger(PORT) || PORT < 1024 || PORT > 65535) throw new Error('COURT_PORT must be between 1024 and 65535');
 await fs.mkdir(STATE_DIR, { recursive: true, mode: 0o700 });
@@ -58,6 +67,17 @@ async function readJsonBody(req) {
     if (Buffer.byteLength(body) > MAX_BODY_BYTES) throw new Error('Request body is too large');
   }
   return JSON.parse(body || '{}');
+}
+
+async function readRawBody(req, limit = MAX_PROXY_BODY_BYTES) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > limit) throw new Error('Proxy request body is too large');
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
 }
 
 function isLocalRequest(req) {
@@ -168,10 +188,75 @@ async function routerModels() {
     const response = await fetch(`${ROUTER_URL}/v1/models`, { headers: { authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(2500) });
     if (!response.ok) return { online: false, models: [], error: `Router returned ${response.status}` };
     const body = await response.json();
-    const modelDetails = (body.data || []).map((model) => ({ id: model.id, ownedBy: model.owned_by || null })).sort((a, b) => a.id.localeCompare(b.id));
+    const modelDetails = (body.data || []).map((model) => ({ id: model.id, ownedBy: model.owned_by || null, input_modalities: model.input_modalities || model.inputModalities })).sort((a, b) => a.id.localeCompare(b.id));
     return { online: true, models: modelDetails.map((model) => model.id), modelDetails };
   } catch {
     return { online: false, models: [], error: 'Router is not running' };
+  }
+}
+
+async function verifiedRouterModels() {
+  const router = await routerModels();
+  if (!router.online) return router;
+  const modelDetails = filterVerifiedModels(router.modelDetails || []);
+  return { ...router, models: modelDetails.map((model) => model.id), modelDetails };
+}
+
+async function proxyRouterRequest(req, res, url) {
+  const abort = new AbortController();
+  res.once('close', () => { if (!res.writableFinished) abort.abort(); });
+  try {
+    const key = await apiKey();
+    if (!key) return json(res, { error: 'No local Router key found' }, 503);
+    if (req.headers.authorization !== `Bearer ${key}`) return json(res, { error: 'Unauthorized' }, 401);
+    const headers = { authorization: `Bearer ${key}` };
+    for (const name of ['accept', 'content-encoding', 'content-type', 'openai-beta', 'user-agent', 'x-opencode-session', 'session_id', 'session-id', 'conversation_id', 'x-codex-turn-metadata', 'x-codex-turn-state']) {
+      if (req.headers[name]) headers[name] = req.headers[name];
+    }
+    const hasBody = !['GET', 'HEAD'].includes(req.method);
+    let body = hasBody ? await readRawBody(req) : undefined;
+    const isResponses = req.method === 'POST' && ['/v1/responses', '/v1/responses/compact'].includes(url.pathname);
+    let prepared;
+    if (isResponses) {
+      if (req.headers['content-encoding'] && req.headers['content-encoding'] !== 'identity') {
+        return json(res, { error: { code: 'unsupported_content_encoding', message: 'Court conversation switching requires uncompressed JSON requests.' } }, 415);
+      }
+      prepared = await responseHistory.prepare(JSON.parse(body.toString('utf8')));
+      body = JSON.stringify(prepared.request);
+    }
+    const upstream = await fetch(`${ROUTER_URL}${url.pathname}${url.search}`, {
+      method: req.method,
+      headers,
+      body,
+      signal: abort.signal
+    });
+    const responseHeaders = {
+      'content-type': upstream.headers.get('content-type') || 'application/json; charset=utf-8',
+      'cache-control': 'no-store'
+    };
+    const requestId = upstream.headers.get('x-request-id');
+    if (requestId) responseHeaders['x-request-id'] = requestId;
+    if (isResponses && upstream.ok && !(upstream.headers.get('content-type') || '').includes('text/event-stream')) {
+      const response = await upstream.json();
+      await responseHistory.save(prepared, response, { compact: url.pathname.endsWith('/compact') });
+      res.writeHead(upstream.status, securityHeaders(responseHeaders));
+      return res.end(JSON.stringify(response));
+    }
+    res.writeHead(upstream.status, securityHeaders(responseHeaders));
+    if (!upstream.body) return res.end();
+    if (isResponses && upstream.ok) {
+      const events = new ResponseEventReader((response) => responseHistory.save(prepared, response));
+      for await (const chunk of upstream.body) {
+        await events.push(chunk);
+        if (!res.write(chunk)) await once(res, 'drain', { signal: abort.signal });
+      }
+      await events.push(new Uint8Array(), true);
+      return res.end();
+    }
+    Readable.fromWeb(upstream.body).pipe(res);
+  } catch (error) {
+    if (!res.headersSent) return json(res, { error: { code: error.code || 'proxy_error', message: error.message } }, error.status || (error.message.includes('too large') ? 413 : error instanceof SyntaxError ? 400 : 502));
+    res.destroy(error);
   }
 }
 
@@ -216,7 +301,7 @@ async function accounts() {
 }
 
 async function overview() {
-  const [router, accountRows, geminiCli] = await Promise.all([routerModels(), accounts(), geminiCliStatus()]);
+  const [router, accountRows, geminiCli] = await Promise.all([verifiedRouterModels(), accounts(), geminiCliStatus()]);
   const providers = Object.values(accountRows.reduce((all, account) => {
     const group = all[account.provider] ||= { name: account.provider, accounts: [], models: [] };
     group.accounts.push(account);
@@ -285,6 +370,19 @@ async function validateRequestedModel(baseUrl, apiKey, modelId, discovered) {
   if (!response.ok || body.data?.id !== modelId) throw new Error(`OpenRouter did not confirm model ${modelId}`);
 }
 
+function openRouterConnection(providers) {
+  return providers.find((provider) => {
+    try { return new URL(provider.baseUrl).hostname === 'openrouter.ai' && provider.apiKey; }
+    catch { return false; }
+  });
+}
+
+async function saveCustomProviders(providers) {
+  await fs.writeFile(CUSTOM_PROVIDERS, JSON.stringify(providers, null, 2), { mode: 0o600 });
+  await fs.chmod(CUSTOM_PROVIDERS, 0o600);
+  await writeRouterProviders(providers);
+}
+
 async function writeRouterProviders(providers) {
   const current = await fs.readFile(CONFIG, 'utf8');
   const start = '# >>> COURT CUSTOM PROVIDERS';
@@ -314,7 +412,7 @@ async function writeRouterProviders(providers) {
 async function codexMode() {
   const config = await fs.readFile(CODEX_CONFIG, 'utf8').catch(() => '');
   if (!/model_provider\s*=\s*["']cliproxyapi["']/.test(config)) return 'normal';
-  return /^model\s*=\s*["']gemini-3\.8-flash-high["']/m.test(config) ? 'gemini' : 'court';
+  return /^model\s*=\s*["']gemini-3\.7-flash-high["']/m.test(config) ? 'gemini' : 'court';
 }
 
 async function setCodexMode(mode) {
@@ -323,45 +421,58 @@ async function setCodexMode(mode) {
   await fs.copyFile(CODEX_CONFIG, `${CODEX_CONFIG}.${Math.floor(Date.now() / 1000)}.bak`);
   if (mode !== 'normal' && previousMode === 'normal') {
     const model = config.match(/^model\s*=\s*(["'][^"']*["'])/m)?.[1] || null;
-    await fs.writeFile(CODEX_MODE_STATE, JSON.stringify({ model }), { mode: 0o600 });
+    const modelCatalogJson = config.match(/^model_catalog_json\s*=\s*(["'][^"']*["'])/m)?.[1] || null;
+    await fs.writeFile(CODEX_MODE_STATE, JSON.stringify({ model, modelCatalogJson }), { mode: 0o600 });
   }
   const providerBlock = /\n?\[model_providers\.cliproxyapi\]\n[\s\S]*?(?=\n\[|$)/;
-  config = config.replace(/^model_provider\s*=.*\n/m, '').replace(providerBlock, '\n');
+  config = config
+    .replace(/^model_provider\s*=.*\n/m, '')
+    .replace(/^model_catalog_json\s*=.*\n/m, '')
+    .replace(providerBlock, '\n');
   if (mode === 'normal') {
     try {
       const saved = JSON.parse(await fs.readFile(CODEX_MODE_STATE, 'utf8'));
       if (saved.model) config = config.replace(/^model\s*=.*$/m, `model = ${saved.model}`);
+      if (saved.modelCatalogJson) config = `model_catalog_json = ${saved.modelCatalogJson}\n${config}`;
       await fs.unlink(CODEX_MODE_STATE);
     } catch {}
   } else {
+    const router = await verifiedRouterModels();
+    if (!router.online) throw new Error(router.error);
+    await fs.writeFile(CODEX_MODEL_CATALOG, `${JSON.stringify(toCodexCatalog(router.modelDetails), null, 2)}\n`, { mode: 0o600 });
+    if (mode === 'court') {
+      const defaultModel = router.modelDetails.find((model) => model.id === 'gpt-6.1-sol') || router.modelDetails.find((model) => model.ownedBy === 'openai');
+      if (!defaultModel) throw new Error('Connect a ChatGPT account before enabling Court models.');
+      if (/^model\s*=/m.test(config)) config = config.replace(/^model\s*=.*$/m, `model = ${JSON.stringify(defaultModel.id)}`);
+      else config = `model = ${JSON.stringify(defaultModel.id)}\n${config}`;
+    }
     if (mode === 'gemini') {
-      if (/^model\s*=/m.test(config)) config = config.replace(/^model\s*=.*$/m, 'model = "gemini-3.8-flash-high"');
-      else config = `model = "gemini-3.8-flash-high"\n${config}`;
+      if (/^model\s*=/m.test(config)) config = config.replace(/^model\s*=.*$/m, 'model = "gemini-3.7-flash-high"');
+      else config = `model = "gemini-3.7-flash-high"\n${config}`;
     }
     const firstLineEnd = config.indexOf('\n') + 1;
-    config = `${config.slice(0, firstLineEnd)}model_provider = "cliproxyapi"\n${config.slice(firstLineEnd).replace(/^\n+/, '')}`;
-    config = `${config.trimEnd()}\n\n[model_providers.cliproxyapi]\nname = "Court Router"\nbase_url = "${ROUTER_URL}/v1"\nenv_key = "CLIPROXYAPI_API_KEY"\nwire_api = "responses"\n`;
+    config = `${config.slice(0, firstLineEnd)}model_provider = "cliproxyapi"\nmodel_catalog_json = ${JSON.stringify(CODEX_MODEL_CATALOG)}\n${config.slice(firstLineEnd).replace(/^\n+/, '')}`;
+    config = `${config.trimEnd()}\n\n[model_providers.cliproxyapi]\nname = "Court Router"\nbase_url = "${COURT_API_URL}"\nenv_key = "CLIPROXYAPI_API_KEY"\nwire_api = "responses"\nrequires_openai_auth = true\n`;
   }
   await fs.writeFile(CODEX_CONFIG, config, { mode: 0o600 });
 }
 
-function restartChatGPT(mode) {
-  const quit = spawn('osascript', ['-e', 'tell application "ChatGPT" to quit'], { stdio: 'ignore' });
-  quit.once('exit', () => setTimeout(async () => {
-    const env = { ...process.env };
-    if (mode !== 'normal') env.CLIPROXYAPI_API_KEY = await apiKey();
-    else delete env.CLIPROXYAPI_API_KEY;
-    for (const key of ['PYTHONHOME', 'PYTHONPATH', 'PYTHONDONTWRITEBYTECODE']) delete env[key];
-    const launcher = spawn('/Applications/ChatGPT.app/Contents/Resources/codex', ['app'], {
-      cwd: HOME, env, detached: true, stdio: 'ignore'
-    });
-    launcher.unref();
-  }, 1_500));
+async function restartChatGPT(mode) {
+  const key = mode === 'normal' ? '' : await apiKey();
+  await restartMacChatGPT(mode, key);
 }
 
 const server = http.createServer(async (req, res) => {
   if (!isLocalRequest(req)) return json(res, { error: 'Local requests only' }, 403);
   const url = new URL(req.url, `http://${HOST}:${PORT}`);
+  if (url.pathname === '/v1/models' && req.method === 'GET') {
+    const key = await apiKey();
+    if (!key || req.headers.authorization !== `Bearer ${key}`) return json(res, { error: 'Unauthorized' }, 401);
+    const router = await verifiedRouterModels();
+    if (!router.online) return json(res, { error: router.error }, 503);
+    return json(res, toCodexCatalog(router.modelDetails));
+  }
+  if (url.pathname.startsWith('/v1/')) return proxyRouterRequest(req, res, url);
   if (url.pathname === '/api/overview') return json(res, await overview());
   if (url.pathname === '/api/codex-mode' && req.method === 'GET') return json(res, { mode: await codexMode() });
   if (url.pathname === '/api/codex-mode' && req.method === 'POST') {
@@ -371,12 +482,12 @@ const server = http.createServer(async (req, res) => {
       if (mode !== 'normal') {
         const router = await routerModels();
         if (!router.online) throw new Error('Router is offline. Start it before launching Codex.');
-        if (mode === 'gemini' && !router.models.includes('gemini-3.8-flash-high')) throw new Error('Gemini 3.8 Flash is not available in the current router pool.');
+        if (mode === 'gemini' && !router.models.includes('gemini-3.7-flash-high')) throw new Error('Gemini 3.7 Flash is not available in the current router pool.');
       }
       await setCodexMode(mode);
-      const message = mode === 'gemini' ? 'Restarting Codex with Gemini 3.8 Flash.' : mode === 'court' ? 'Restarting Codex with Court models.' : 'Restoring your normal ChatGPT account.';
+      const message = mode === 'gemini' ? 'Restarting Codex with Gemini 3.7 Flash.' : mode === 'court' ? 'Restarting Codex with Court models.' : 'Restoring your normal ChatGPT account.';
       json(res, { ok: true, mode, message });
-      setTimeout(() => restartChatGPT(mode), 700);
+      setTimeout(() => restartChatGPT(mode).catch(() => {}), 700);
       return;
     } catch (error) { return json(res, { error: error.message }, 400); }
   }
@@ -401,10 +512,29 @@ const server = http.createServer(async (req, res) => {
       const entry = { name, prefix, baseUrl, apiKey, models, updatedAt: new Date().toISOString() };
       const index = providers.findIndex((provider) => provider.prefix === prefix);
       if (index >= 0) providers[index] = entry; else providers.push(entry);
-      await fs.writeFile(CUSTOM_PROVIDERS, JSON.stringify(providers, null, 2), { mode: 0o600 });
-      await fs.chmod(CUSTOM_PROVIDERS, 0o600);
-      await writeRouterProviders(providers);
+      await saveCustomProviders(providers);
       return json(res, { ok: true, models, message: `Connected ${name} with ${models.length} models.` }, 201);
+    } catch (error) { return json(res, { error: error.message }, 400); }
+  }
+  if (url.pathname === '/api/openrouter-routers' && req.method === 'POST') {
+    try {
+      const providers = await readCustomProviders();
+      const source = openRouterConnection(providers);
+      if (!source) throw new Error('Connect an OpenRouter API key first.');
+      const models = ['openrouter/free', 'openrouter/auto'];
+      const discovered = await discoverModels(source.baseUrl, source.apiKey);
+      for (const model of models) await validateRequestedModel(source.baseUrl, source.apiKey, model, discovered);
+      const entry = {
+        ...source,
+        name: 'OpenRouter',
+        models: [...new Set([...source.models, ...models])],
+        updatedAt: new Date().toISOString()
+      };
+      const next = providers
+        .filter((provider) => provider.prefix !== 'openrouter-router')
+        .map((provider) => provider === source ? entry : provider);
+      await saveCustomProviders(next);
+      return json(res, { ok: true, models, message: 'Added OpenRouter Free and Auto routers.' }, 201);
     } catch (error) { return json(res, { error: error.message }, 400); }
   }
   if (url.pathname === '/api/custom-providers' && req.method === 'DELETE') {
@@ -413,8 +543,7 @@ const server = http.createServer(async (req, res) => {
       const providers = await readCustomProviders();
       const next = providers.filter((provider) => provider.prefix !== prefix);
       if (next.length === providers.length) return json(res, { error: 'Provider not found' }, 404);
-      await fs.writeFile(CUSTOM_PROVIDERS, JSON.stringify(next, null, 2), { mode: 0o600 });
-      await writeRouterProviders(next);
+      await saveCustomProviders(next);
       return json(res, { ok: true, message: 'Custom provider removed.' });
     } catch (error) { return json(res, { error: error.message }, 400); }
   }

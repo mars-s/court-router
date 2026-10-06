@@ -7,7 +7,8 @@
   "bin": { "court": "./court" },
   "scripts": {
     "start": "node server.mjs",
-    "check": "node --check server.mjs && node --check public/app.js",
+    "check": "node --check server.mjs && node --check public/app.js && node --check lib/response-history.mjs",
+    "test": "node --test scripts/*.test.mjs",
     "security": "node scripts/security-check.mjs"
   },
   "engines": { "node": ">=20" },

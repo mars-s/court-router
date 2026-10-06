@@ -1,0 +1,141 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { ResponseHistory, ResponseEventReader } from '../lib/response-history.mjs';
+
+const message = (role, content) => ({ type: 'message', role, content });
+const reply = (id, output, status = 'completed') => ({ id, status, output });
+
+async function fixture(t, options) {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'court-history-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  return { directory, history: new ResponseHistory(directory, options) };
+}
+
+test('GPT to Claude to GPT keeps messages and tool results, with reasoning owned by its provider', async (t) => {
+  const { directory, history } = await fixture(t);
+  const first = await history.prepare({ model: 'gpt-6.1-sol', instructions: 'Keep the user constraints.', input: [message('user', 'Use Australian English.')] });
+  const reasoning = { type: 'reasoning', id: 'gpt-reason', encrypted_content: 'native-openai-context' };
+  const call = { type: 'function_call', id: 'tool-item', call_id: 'call-1', name: 'exec_command', arguments: '{"cmd":"pwd"}' };
+  await history.save(first, reply('resp-gpt', [reasoning, call]));
+  const toolResult = { type: 'function_call_output', call_id: 'call-1', output: 'project-directory' };
+  const second = await history.prepare({ model: 'claude-sonnet-4-6', previous_response_id: 'resp-gpt', instructions: 'Keep the user constraints.', input: [toolResult, message('user', 'Continue with Claude.')] });
+  assert.equal('previous_response_id' in second.request, false);
+  assert.equal(second.request.instructions, first.request.instructions);
+  assert.deepEqual(second.request.input, [first.input[0], { ...call, id: undefined }, toolResult, message('user', 'Continue with Claude.')].map((item) => { const copy = { ...item }; if (copy.id === undefined) delete copy.id; return copy; }));
+  const claudeReasoning = { type: 'reasoning', id: 'claude-reason', encrypted_content: 'native-claude-signature' };
+  await history.save(second, reply('resp-claude', [claudeReasoning, message('assistant', 'The project uses Australian English.')]));
+  // A restart must preserve the chain and provenance, not just in-memory state.
+  const restarted = new ResponseHistory(directory);
+  const third = await restarted.prepare({ model: 'gpt-6.1-sol', previous_response_id: 'resp-claude', input: 'Continue with ChatGPT.' });
+  assert(third.request.input.some((item) => item.id === 'gpt-reason'));
+  assert(!third.request.input.some((item) => item.id === 'claude-reason'));
+  assert(third.request.input.some((item) => item.call_id === 'call-1' && item.output === 'project-directory'));
+  assert(third.request.input.some((item) => item.content === 'The project uses Australian English.'));
+  assert.equal((await fs.stat(directory)).mode & 0o777, 0o700);
+  for (const name of await fs.readdir(directory)) assert.equal((await fs.stat(path.join(directory, name))).mode & 0o777, 0o600);
+});
+
+test('full-history switching removes foreign reasoning even without previous_response_id', async (t) => {
+  const { history } = await fixture(t);
+  const initial = await history.prepare({ model: 'claude-sonnet-4-6', input: 'Hello' });
+  const output = [{ type: 'reasoning', id: 'rs-claude', encrypted_content: 'claude-signature' }, message('assistant', 'Hello from Claude.')];
+  await history.save(initial, reply('claude-full', output));
+  const next = await history.prepare({ model: 'gpt-6.1-sol', input: [...initial.input, ...output, message('user', 'Continue')] });
+  assert.deepEqual(next.request.input, [initial.input[0], output[1], message('user', 'Continue')]);
+  const sameProvider = await history.prepare({ model: 'claude-sonnet-4-6', input: [...initial.input, ...output] });
+  assert.deepEqual(sameProvider.request.input, [...initial.input, ...output]);
+});
+
+test('full-history edits, independent chats and branches do not pick up other turns', async (t) => {
+  const { history } = await fixture(t);
+  await Promise.all(['one', 'two'].map(async (id) => {
+    const prepared = await history.prepare({ model: 'gpt-6.1-sol', input: id });
+    await history.save(prepared, reply(id, [message('assistant', `${id}-reply`)]));
+  }));
+  for (const id of ['one', 'two']) {
+    const next = await history.prepare({ model: 'claude-sonnet-4-6', previous_response_id: id, input: `${id}-next` });
+    assert.deepEqual(next.request.input.map((item) => item.content), [id, `${id}-reply`, `${id}-next`]);
+  }
+  const edited = await history.prepare({ model: 'claude-sonnet-4-6', input: 'Replacement first turn' });
+  assert.deepEqual(edited.request.input, [{ role: 'user', content: 'Replacement first turn' }]);
+  const branchA = await history.prepare({ model: 'claude-sonnet-4-6', previous_response_id: 'one', input: 'branch A' });
+  await history.save(branchA, reply('branch-A', [message('assistant', 'only branch A')]));
+  const branchB = await history.prepare({ model: 'claude-sonnet-4-6', previous_response_id: 'one', input: 'branch B' });
+  assert(!JSON.stringify(branchB.request).includes('only branch A'));
+});
+
+test('missing history and failed responses never silently start a fresh delta chat', async (t) => {
+  const { history } = await fixture(t);
+  await assert.rejects(history.prepare({ model: 'claude-sonnet-4-6', previous_response_id: '../../missing', input: 'continue' }), { code: 'previous_response_not_found' });
+  const prepared = await history.prepare({ model: 'gpt-6.1-sol', input: 'request' });
+  await history.save(prepared, reply('failed', [message('assistant', 'partial')], 'failed'));
+  await assert.rejects(history.prepare({ model: 'gpt-6.1-sol', previous_response_id: 'failed', input: 'continue' }), { code: 'previous_response_not_found' });
+  await assert.rejects(history.prepare(null), { code: 'invalid_request' });
+  await assert.rejects(history.prepare({ model: 'gpt-6.1-sol', input: {} }), { code: 'invalid_input' });
+});
+
+test('foreign compaction replays readable source history and unknown compaction is rejected', async (t) => {
+  const { history } = await fixture(t);
+  const original = [message('user', 'Keep this important original constraint.'), message('assistant', 'Completed step one.')];
+  const prepared = await history.prepare({ model: 'gpt-6.1-sol', input: original });
+  const compacted = { type: 'compaction', id: 'compact-item', encrypted_content: 'opaque-compacted-context' };
+  await history.save(prepared, { id: 'compact-response', output: [compacted] }, { compact: true });
+  const switched = await history.prepare({ model: 'claude-sonnet-4-6', input: [compacted, message('user', 'Do step two.')] });
+  assert.deepEqual(switched.request.input, [...original, message('user', 'Do step two.')]);
+  const same = await history.prepare({ model: 'gpt-6.1-sol', input: [compacted] });
+  assert.deepEqual(same.request.input, [compacted]);
+  await assert.rejects(history.prepare({ model: 'claude-sonnet-4-6', input: [{ type: 'compaction', encrypted_content: 'unknown' }] }), { code: 'portable_context_unavailable' });
+});
+
+test('references are expanded with the correct provider provenance', async (t) => {
+  const { history } = await fixture(t);
+  const prepared = await history.prepare({ model: 'gpt-6.1-sol', input: 'hello' });
+  const output = { id: 'message-reference', ...message('assistant', 'A remembered answer') };
+  await history.save(prepared, reply('reference-response', [output]));
+  const next = await history.prepare({ model: 'claude-sonnet-4-6', input: [{ type: 'item_reference', id: output.id }] });
+  assert.deepEqual(next.request.input, [message('assistant', 'A remembered answer')]);
+  await assert.rejects(history.prepare({ model: 'gpt-6.1-sol', input: [{ type: 'item_reference', id: 'unknown' }] }), { code: 'history_reference_not_found' });
+});
+
+test('cache eviction is bounded and unknown non-target providers retain their existing request format', async (t) => {
+  const { directory, history } = await fixture(t, { maxEntries: 1 });
+  for (const id of ['old', 'new']) {
+    const prepared = await history.prepare({ model: 'gpt-6.1-sol', input: id });
+    await history.save(prepared, reply(id, [message('assistant', id)]));
+  }
+  assert.equal((await fs.readdir(directory)).length, 1);
+  await assert.rejects(history.prepare({ model: 'claude-sonnet-4-6', previous_response_id: 'old', input: 'continue' }), { code: 'previous_response_not_found' });
+  const request = { model: 'gemini-3-flash', input: 'hello', previous_response_id: 'upstream' };
+  assert.deepEqual((await history.prepare(request)).request, request);
+});
+
+test('SSE captures completed responses across Unicode and CRLF chunk boundaries before forwarding', async () => {
+  const completed = [];
+  const reader = new ResponseEventReader(async (response) => { completed.push(response); });
+  const response = reply('streamed', [message('assistant', 'Australian café')]);
+  const bytes = Buffer.from(`: keepalive\r\n\r\ndata: ${JSON.stringify({ type: 'response.completed', response })}\r\n\r\ndata: [DONE]\r\n\r\n`);
+  for (let offset = 0; offset < bytes.length; offset += 3) await reader.push(bytes.subarray(offset, offset + 3));
+  await reader.push(new Uint8Array(), true);
+  assert.deepEqual(completed, [response]);
+  const truncated = new ResponseEventReader(async () => assert.fail('must not commit'));
+  await truncated.push(Buffer.from('data: {"type":"response.completed"'));
+  await assert.rejects(truncated.push(new Uint8Array(), true), { code: 'incomplete_stream' });
+  const oversized = new ResponseEventReader(async () => {}, { maxEventBytes: 5 });
+  await assert.rejects(oversized.push(Buffer.from('data: 123456\n\n')), { code: 'response_too_large' });
+});
+
+test('reasoning provenance survives snapshot eviction for an ongoing full-history chat', async (t) => {
+  const { directory, history } = await fixture(t, { maxEntries: 1 });
+  const first = await history.prepare({ model: 'claude-sonnet-4-6', input: 'first' });
+  const thought = { type: 'reasoning', encrypted_content: 'earlier-claude-signature' };
+  await history.save(first, reply('first', [thought, message('assistant', 'Claude answer')]));
+  const second = await history.prepare({ model: 'gpt-6.1-sol', previous_response_id: 'first', input: 'continue' });
+  await history.save(second, reply('second', [message('assistant', 'GPT answer')]));
+  const restarted = new ResponseHistory(directory, { maxEntries: 1 });
+  const third = await restarted.prepare({ model: 'gpt-6.1-sol', previous_response_id: 'second', input: 'continue again' });
+  assert(!third.request.input.some((item) => item.type === 'reasoning'));
+  assert(third.request.input.some((item) => item.content === 'Claude answer'));
+});

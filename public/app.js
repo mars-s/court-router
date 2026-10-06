@@ -100,11 +100,14 @@ function renderManage() {
     return `<article class="provider-connect ${providerClass(name)}"><h2>${mark(name)}${safe(name)}</h2><div class="connect-state">${count ? `${plural(count, 'account')} connected` : 'No accounts connected yet'}</div><button class="connect-button" data-connect="${id}">${count ? 'Add another account' : 'Connect account'}</button></article>`;
   }).join('');
   const custom = customProviders.map((provider) => `<article class="provider-connect custom-provider provider-Codex"><h2><span class="provider-mark">API</span>${safe(provider.name)}</h2><div class="connect-state">${plural(provider.models.length, 'model')} · ${safe(provider.keyHint)}<br><code>${safe(provider.prefix)}/...</code></div><button class="remove-provider" data-remove="${safe(provider.prefix)}">Remove</button></article>`).join('');
-  qs('#provider-list').innerHTML = `${oauth}${custom}<button class="add-provider" id="add-union-alpha"><div><span aria-hidden="true">+</span>Add Pareto (Union Alpha)</div></button><button class="add-provider" id="add-provider"><div><span aria-hidden="true">+</span>Add custom OpenAI API</div></button>`;
+  const hasOpenRouterRouters = customProviders.some((provider) => provider.models.includes('openrouter/free') && provider.models.includes('openrouter/auto'));
+  const openRouterAction = hasOpenRouterRouters ? 'Refresh OpenRouter Free + Auto' : 'Add OpenRouter Free + Auto';
+  qs('#provider-list').innerHTML = `${oauth}${custom}<button class="add-provider" id="add-openrouter-routers"><div><span aria-hidden="true">+</span>${openRouterAction}</div></button><button class="add-provider" id="add-union-alpha"><div><span aria-hidden="true">+</span>Add Pareto (Union Alpha)</div></button><button class="add-provider" id="add-provider"><div><span aria-hidden="true">+</span>Add custom OpenAI API</div></button>`;
   qs('#provider-count').textContent = plural(connectProviders.length + customProviders.length, 'provider');
   qsa('[data-connect]').forEach((button) => button.addEventListener('click', () => connect(button)));
   qsa('[data-remove]').forEach((button) => button.addEventListener('click', () => removeProvider(button.dataset.remove)));
   qs('#add-provider').addEventListener('click', () => qs('#endpoint-dialog').showModal());
+  qs('#add-openrouter-routers').addEventListener('click', addOpenRouterRouters);
   qs('#add-union-alpha').addEventListener('click', () => {
     const form = qs('#endpoint-form');
     form.reset();
@@ -116,6 +119,20 @@ function renderManage() {
     qs('#endpoint-dialog').showModal();
     form.elements.apiKey.focus();
   });
+}
+
+async function addOpenRouterRouters() {
+  const button = qs('#add-openrouter-routers');
+  button.disabled = true;
+  try {
+    const response = await fetch('/api/openrouter-routers', { method: 'POST' });
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.error);
+    showToast(body.message);
+    await loadCustomProviders();
+    setTimeout(refresh, 1200);
+  } catch (error) { showToast(error.message || 'Could not add OpenRouter routers'); }
+  finally { button.disabled = false; }
 }
 
 function showToast(message) {
@@ -194,16 +211,16 @@ async function loadCodexMode() {
     const response = await fetch('/api/codex-mode');
     const { mode } = await response.json();
     qs('#codex-mode-copy').textContent = mode === 'gemini'
-      ? 'Using Gemini 3.8 Flash through your Antigravity pool'
+      ? 'Using Gemini 3.7 Flash through your Antigravity pool'
       : mode === 'court'
-        ? 'Using Court Router and its model pool'
+        ? 'ChatGPT stays signed in. Choose GPT or Claude in the same chat'
         : 'Using your normal ChatGPT account';
     qsa('[data-mode]').forEach((button) => button.classList.toggle('active', button.dataset.mode === mode));
   } catch { qs('#codex-mode-copy').textContent = 'Could not read Codex configuration'; }
 }
 
 async function changeCodexMode(mode) {
-  const label = mode === 'gemini' ? 'Gemini 3.8 Flash' : mode === 'court' ? 'Court models' : 'your normal ChatGPT account';
+  const label = mode === 'gemini' ? 'Gemini 3.7 Flash' : mode === 'court' ? 'ChatGPT and Claude through Court' : 'your normal ChatGPT account';
   if (!confirm(`Restart the Codex App using ${label}? Any running tasks will be interrupted.`)) return;
   qsa('[data-mode]').forEach((button) => { button.disabled = true; });
   try {
