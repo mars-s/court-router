@@ -24,6 +24,11 @@ case "${1:-help}" in
     ;;
   down)
     if running; then kill "$(<"$PIDFILE")"; rm -f "$PIDFILE"; echo "Court is down"; else rm -f "$PIDFILE"; echo "Court is not running"; fi
+    # In Court mode every ChatGPT chat goes through Court, GPT included.
+    if grep -qF "openai_base_url = \"$URL/chatgpt\"" "${COURT_CODEX_CONFIG:-$HOME/.codex/config.toml}" 2>/dev/null; then
+      echo "Warning: Court mode is still on, so ChatGPT chats will fail until Court is back up." >&2
+      echo "To use ChatGPT without Court, start Court and choose Restore ChatGPT first." >&2
+    fi
     ;;
   status)
     if running; then echo "Court is up at $URL"; else echo "Court is down"; fi

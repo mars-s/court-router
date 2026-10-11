@@ -73,11 +73,28 @@ as the default. In Codex, start a chat with GPT. Once its reply finishes, choose
 Choose GPT again to continue with ChatGPT. Switching models between turns does
 not require another restart or a new chat.
 
-Court keeps your existing ChatGPT sign-in active with `requires_openai_auth = true`.
-Your dot and other account features retain that identity. Model requests use the
-separate local router key through `env_key`; Court does not receive your desktop
-ChatGPT login token. Your dot continues to run in ChatGPT's cloud and does not
-switch to Claude when you select Claude for a local chat.
+Choose **Restore ChatGPT** to turn Court off. Court restores the native ChatGPT
+model picker and your previous GPT model, then switches existing Court chats to
+that GPT model before reopening the app. Active and archived chats keep their
+history. If a chat cannot be restored, Court reports the failure so you can retry.
+
+Court mode keeps every chat on ChatGPT's own `openai` provider and points it at
+Court with `openai_base_url = "http://127.0.0.1:8477/chatgpt"`. Court picks the
+backend for each turn from the model name. GPT turns go to ChatGPT unchanged,
+with your own sign-in. Claude and other Router turns go to CLIProxyAPI with the
+local router key. Because the provider never changes, picking Claude in a chat
+that started with GPT no longer fails with "model is not supported when using
+Codex with a ChatGPT account". Court does see your ChatGPT login token: it
+forwards it to ChatGPT for GPT turns, and checks it against `~/.codex/auth.json`
+before it lets a request use the router key. It never logs it. Your dot
+continues to run in ChatGPT's cloud and does not switch to Claude when you select
+Claude for a local chat.
+
+Claude gets the same Codex tools as GPT. Court turns Codex's GPT-only tool shapes
+into plain functions and turns Claude's calls back. `tool_search` loads deferred
+tools, so subagents, Sites, apps such as GitHub and Gmail, MCP servers and
+plugins all work. `apply_patch` edits files. See `docs/feature-parity.md` for
+what was tested and what is still open.
 
 Current GPT chat models and Claude 3 or later accept image attachments through
 Court. The native model catalogue advertises both text and image inputs for
@@ -89,8 +106,9 @@ each request and preserves session headers, messages, instructions, tool calls,
 and tool results. When a client sends only new input and a `previous_response_id`,
 Court rebuilds the transcript from saved responses. Full-history requests remain
 authoritative, so an edited or rolled-back chat does not regain discarded turns.
-Provider-specific reasoning stays with its originating provider. Saved compacted
-context is expanded to readable history when another provider needs it.
+Provider-specific reasoning stays with its originating provider. When Claude
+takes over a chat that GPT has compacted, GPT writes a plain handoff summary of
+its compacted context and Claude receives that, as in T3 Code.
 
 Court stores response history in a private `response-history` directory under
 its state directory, with directory mode `700` and file mode `600`. It retains
@@ -154,6 +172,29 @@ The automated tests cover catalogue generation, macOS launch commands and
 conversation forwarding through a simulated upstream service. They do not
 verify a live provider sign-in or a complete desktop app conversation on your
 machine.
+
+## Debugging
+
+These tools look inside each layer between the ChatGPT app and the models.
+
+- `node scripts/debug/doctor.mjs` shows Court, the Router, the Codex config,
+  chats with a broken index, Court's recent trace and recent app log errors.
+- Create `trace.on` in Court's state folder, or start Court with
+  `COURT_TRACE=1`, to record every model request in `trace.jsonl`: backend,
+  model, status, error text and the history's item types and reasoning IDs.
+  Message text is never recorded.
+- `node scripts/debug/app-server.mjs METHOD 'PARAMS_JSON' ...` calls the
+  desktop app's own Codex app-server, the API its UI uses for reading,
+  resuming and editing (`thread/revert`) chats. Add `--home DIR` to work on
+  copied chats.
+- `node scripts/debug/chat-index.mjs` lists chats that fail to edit with
+  "durable rollout shrank before projection". Quit ChatGPT and add `--apply`
+  to rebuild them. Court also does this whenever it restarts ChatGPT.
+
+Codex keeps an index of each chat that records how far into the chat file it
+has read. Court's cleanup of older chat files makes those files shorter, so
+Court now resets that chat's index at the same time, saving the removed rows
+under `chat-index-backups` in Court's state folder.
 
 ## License
 

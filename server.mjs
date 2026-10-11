@@ -5,10 +5,21 @@ import path from 'node:path';
 import os from 'node:os';
 import { Readable } from 'node:stream';
 import { once } from 'node:events';
+import { pipeline } from 'node:stream/promises';
+import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { restartMacChatGPT } from './lib/macos-app-launch.mjs';
 import { filterVerifiedModels, toCodexCatalog } from './lib/model-catalog.mjs';
 import { ResponseHistory, ResponseEventReader } from './lib/response-history.mjs';
+import { restoreNormalConfig } from './lib/normal-mode.mjs';
+import { restoreNativeCourtChats } from './lib/native-chat-restore.mjs';
+import { repairThreadHistory } from './lib/thread-history.mjs';
+import { bridgeRequest, needsToolBridge, restoreResponse, ToolBridgeStream } from './lib/tool-bridge.mjs';
+import { HANDOFF_PROMPT, wantsCompaction } from './lib/handoff.mjs';
+import { claudeWindow } from './lib/claude-usage.mjs';
+import { StreamOutcome, Trace, traceShape } from './lib/trace.mjs';
+import { revealSealedAgentMessages, unsealPlainAgentMessages } from './lib/agent-messages.mjs';
+import { createHash } from 'node:crypto';
 
 const PORT = Number.parseInt(process.env.COURT_PORT || '8477', 10);
 const HOST = '127.0.0.1';
@@ -18,7 +29,10 @@ const STATE_DIR = process.env.COURT_STATE_DIR || path.join(HOME, '.local', 'stat
 const AUTH_DIR = process.env.COURT_AUTH_DIR || path.join(HOME, '.cli-proxy-api');
 const CONFIG = process.env.COURT_ROUTER_CONFIG || '/opt/homebrew/etc/cliproxyapi.conf';
 const ROUTER_URL = process.env.COURT_ROUTER_URL || 'http://127.0.0.1:8317';
+const CHATGPT_URL = process.env.COURT_CHATGPT_URL || 'https://chatgpt.com/backend-api/codex';
+const CODEX_AUTH = process.env.COURT_CODEX_AUTH || path.join(HOME, '.codex', 'auth.json');
 const COURT_API_URL = `http://${HOST}:${PORT}/v1`;
+const COURT_CHATGPT_URL = `http://${HOST}:${PORT}/chatgpt`;
 const PUBLIC = path.join(ROOT, 'public');
 const COURT_LOG = path.join(STATE_DIR, 'court.log');
 const AUTH_LOG = path.join(STATE_DIR, 'auth.log');
@@ -27,11 +41,40 @@ const LEGACY_CUSTOM_PROVIDERS = path.join(HOME, '.court-providers.json');
 const CODEX_CONFIG = process.env.COURT_CODEX_CONFIG || path.join(HOME, '.codex', 'config.toml');
 const CODEX_MODE_STATE = path.join(STATE_DIR, 'codex-mode.json');
 const CODEX_MODEL_CATALOG = path.join(STATE_DIR, 'codex-model-catalog.json');
+const CODEX_MODELS_CACHE = process.env.COURT_CODEX_MODELS_CACHE || path.join(HOME, '.codex', 'models_cache.json');
 const GEMINI_CREDENTIALS = process.env.COURT_GEMINI_CREDENTIALS || path.join(HOME, '.gemini', 'oauth_creds.json');
 const MAX_BODY_BYTES = 32 * 1024;
 const MAX_PROXY_BODY_BYTES = 32 * 1024 * 1024;
 const quotaCache = new Map();
-const responseHistory = new ResponseHistory(path.join(STATE_DIR, 'response-history'));
+let changingCodexMode = false;
+const responseHistory = new ResponseHistory(path.join(STATE_DIR, 'response-history'), { handoff: gptHandoff });
+const trace = new Trace(STATE_DIR, { redact: (text) => redactLog(text) });
+
+// Records one finished request when tracing is on. Error bodies are kept
+// because they name the item the backend rejected.
+// Successful streams are written when they end, so the line also says how
+// the stream finished. Returns a function that finishes the record.
+async function traceUpstream(route, sent, upstream, extra = {}) {
+  if (!(await trace.enabled())) return () => {};
+  const event = { route, status: upstream.status, requestId: upstream.headers.get('x-request-id'), sent: traceShape(sent), ...extra };
+  if (!upstream.ok) {
+    event.error = await upstream.clone().text().catch(() => null);
+    await trace.write(event);
+    return () => {};
+  }
+  const outcome = new StreamOutcome();
+  let done = false;
+  const finish = (end = {}) => {
+    if (done) return;
+    done = true;
+    const summary = outcome.summary();
+    // The app may hang up right after a finished turn. That is not a failure.
+    if (end.failure === 'client closed the connection' && summary.ended === 'response.completed') end = { closedAfterCompletion: true };
+    return trace.write({ ...event, ...summary, ...end });
+  };
+  finish.watch = (chunk) => outcome.push(chunk);
+  return finish;
+}
 
 if (!Number.isInteger(PORT) || PORT < 1024 || PORT > 65535) throw new Error('COURT_PORT must be between 1024 and 65535');
 await fs.mkdir(STATE_DIR, { recursive: true, mode: 0o700 });
@@ -78,6 +121,17 @@ async function readRawBody(req, limit = MAX_PROXY_BODY_BYTES) {
     chunks.push(chunk);
   }
   return Buffer.concat(chunks);
+}
+
+// Codex compresses large request bodies. Court reads them to keep history and
+// translate tools, then forwards plain JSON.
+const DECODERS = { zstd: zlib.zstdDecompressSync, gzip: zlib.gunzipSync, deflate: zlib.inflateSync, br: zlib.brotliDecompressSync };
+function decodeBody(body, encoding = 'identity') {
+  const name = String(encoding).toLowerCase();
+  if (name === 'identity') return body;
+  if (!DECODERS[name]) throw Object.assign(new Error(`Court cannot read ${encoding} request bodies.`), { code: 'unsupported_content_encoding', status: 415 });
+  try { return DECODERS[name](body, { maxOutputLength: MAX_PROXY_BODY_BYTES }); }
+  catch { throw Object.assign(new Error('Request body could not be decompressed or is too large.'), { code: 'invalid_content_encoding', status: 400 }); }
 }
 
 function isLocalRequest(req) {
@@ -175,6 +229,25 @@ async function codexQuota(filename, data) {
   }
 }
 
+async function claudeQuota(filename, data) {
+  const cached = quotaCache.get(filename);
+  if (cached && Date.now() - cached.time < 60_000) return cached.value;
+  try {
+    const response = await fetch('https://api.anthropic.com/api/oauth/usage', {
+      headers: { authorization: `Bearer ${data.access_token}`, 'anthropic-beta': 'oauth-2025-04-20' },
+      signal: AbortSignal.timeout(6_000)
+    });
+    if (!response.ok) throw new Error(`Usage returned ${response.status}`);
+    const window = claudeWindow(await response.json());
+    if (!window) throw new Error('Usage had no windows');
+    const value = { plan: null, ...window, bankedResets: null };
+    quotaCache.set(filename, { time: Date.now(), value });
+    return value;
+  } catch {
+    return { plan: null, quotaUsed: null, quotaRemaining: null, windowSeconds: null, resetAt: null, bankedResets: null };
+  }
+}
+
 async function apiKey() {
   const config = await fs.readFile(CONFIG, 'utf8').catch(() => '');
   const match = config.match(/^\s*-\s*"([^"]+)"\s*$/m);
@@ -202,34 +275,45 @@ async function verifiedRouterModels() {
   return { ...router, models: modelDetails.map((model) => model.id), modelDetails };
 }
 
-async function proxyRouterRequest(req, res, url) {
+// `routed` is set when the ChatGPT route already checked the caller and read
+// the body. Otherwise the caller must present the Router key.
+async function proxyRouterRequest(req, res, url, routed = null) {
   const abort = new AbortController();
   res.once('close', () => { if (!res.writableFinished) abort.abort(); });
+  let finishTrace = () => {};
   try {
     const key = await apiKey();
     if (!key) return json(res, { error: 'No local Router key found' }, 503);
-    if (req.headers.authorization !== `Bearer ${key}`) return json(res, { error: 'Unauthorized' }, 401);
+    if (!routed && req.headers.authorization !== `Bearer ${key}`) return json(res, { error: 'Unauthorized' }, 401);
     const headers = { authorization: `Bearer ${key}` };
     for (const name of ['accept', 'content-encoding', 'content-type', 'openai-beta', 'user-agent', 'x-opencode-session', 'session_id', 'session-id', 'conversation_id', 'x-codex-turn-metadata', 'x-codex-turn-state']) {
       if (req.headers[name]) headers[name] = req.headers[name];
     }
+    const pathname = routed?.pathname ?? url.pathname;
     const hasBody = !['GET', 'HEAD'].includes(req.method);
-    let body = hasBody ? await readRawBody(req) : undefined;
-    const isResponses = req.method === 'POST' && ['/v1/responses', '/v1/responses/compact'].includes(url.pathname);
+    let body = routed ? routed.body : hasBody ? await readRawBody(req) : undefined;
+    const isResponses = req.method === 'POST' && ['/v1/responses', '/v1/responses/compact'].includes(pathname);
     let prepared;
+    let bridge = null;
+    let traced = null;
     if (isResponses) {
-      if (req.headers['content-encoding'] && req.headers['content-encoding'] !== 'identity') {
-        return json(res, { error: { code: 'unsupported_content_encoding', message: 'Court conversation switching requires uncompressed JSON requests.' } }, 415);
-      }
-      prepared = await responseHistory.prepare(JSON.parse(body.toString('utf8')));
-      body = JSON.stringify(prepared.request);
+      if (!routed) body = decodeBody(body, req.headers['content-encoding']);
+      delete headers['content-encoding'];
+      const received = JSON.parse(body.toString('utf8'));
+      prepared = await responseHistory.prepare(received);
+      prepared.request = await revealSealedAgentMessages(prepared.request, gptRevealAgentMessage);
+      const bridged = bridgeRequest(prepared.request);
+      bridge = bridged.state;
+      body = JSON.stringify(bridged.request);
+      traced = { sent: bridged.request, extra: { path: pathname, received: traceShape(received) } };
     }
-    const upstream = await fetch(`${ROUTER_URL}${url.pathname}${url.search}`, {
+    const upstream = await fetch(`${ROUTER_URL}${pathname}${url.search}`, {
       method: req.method,
       headers,
       body,
       signal: abort.signal
     });
+    if (traced) finishTrace = await traceUpstream('router', traced.sent, upstream, traced.extra);
     const responseHeaders = {
       'content-type': upstream.headers.get('content-type') || 'application/json; charset=utf-8',
       'cache-control': 'no-store'
@@ -237,8 +321,8 @@ async function proxyRouterRequest(req, res, url) {
     const requestId = upstream.headers.get('x-request-id');
     if (requestId) responseHeaders['x-request-id'] = requestId;
     if (isResponses && upstream.ok && !(upstream.headers.get('content-type') || '').includes('text/event-stream')) {
-      const response = await upstream.json();
-      await responseHistory.save(prepared, response, { compact: url.pathname.endsWith('/compact') });
+      const response = restoreResponse(await upstream.json(), bridge);
+      await responseHistory.save(prepared, response, { compact: pathname.endsWith('/compact') });
       res.writeHead(upstream.status, securityHeaders(responseHeaders));
       return res.end(JSON.stringify(response));
     }
@@ -246,15 +330,163 @@ async function proxyRouterRequest(req, res, url) {
     if (!upstream.body) return res.end();
     if (isResponses && upstream.ok) {
       const events = new ResponseEventReader((response) => responseHistory.save(prepared, response));
-      for await (const chunk of upstream.body) {
-        await events.push(chunk);
-        if (!res.write(chunk)) await once(res, 'drain', { signal: abort.signal });
-      }
-      await events.push(new Uint8Array(), true);
+      const rewrite = bridge ? new ToolBridgeStream(bridge) : null;
+      const forward = async (chunk, final = false) => {
+        const out = rewrite ? rewrite.push(chunk, final) : chunk;
+        finishTrace.watch?.(out);
+        await events.push(out, final);
+        if (out.length && !res.write(out)) await once(res, 'drain', { signal: abort.signal });
+      };
+      for await (const chunk of upstream.body) await forward(chunk);
+      await forward(new Uint8Array(), true);
+      await finishTrace();
       return res.end();
     }
-    Readable.fromWeb(upstream.body).pipe(res);
+    await pipeline(Readable.fromWeb(upstream.body), res).catch(() => {});
   } catch (error) {
+    const failure = abort.signal.aborted ? 'client closed the connection' : error.message;
+    if (finishTrace.watch) await finishTrace({ failure });
+    else await trace.write({ route: 'router', path: routed?.pathname ?? url.pathname, failure });
+    if (!res.headersSent) return json(res, { error: { code: error.code || 'proxy_error', message: error.message } }, error.status || (error.message.includes('too large') ? 413 : error instanceof SyntaxError ? 400 : 502));
+    res.destroy(error);
+  }
+}
+
+// GPT summarises its own compacted context for the next model, using the
+// signed-in ChatGPT account. Returns null when that is not possible.
+async function gptHandoff(item) {
+  return gptText('You write handoff summaries so another model can continue a conversation.',
+    [{ type: 'compaction', encrypted_content: item.encrypted_content }, { type: 'message', role: 'user', content: [{ type: 'input_text', text: HANDOFF_PROMPT }] }]);
+}
+
+// A GPT parent seals subagent task text so only GPT can read it. Claude
+// children get it back as plain text, read out by GPT once and cached.
+const revealed = new Map();
+async function gptRevealAgentMessage(item) {
+  const key = createHash('sha256').update(item.content[0].encrypted_content).digest('hex');
+  if (revealed.has(key)) return revealed.get(key);
+  const text = await gptText(`You are ${item.recipient || 'a subagent'}. Your teammate on another model will do the task you were just assigned, so you are handing it over. Output the task payload you received, word for word, with nothing added.`, [
+    item,
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Hand over the task now: write the payload you were sent, verbatim.' }] }
+  ]);
+  if (text != null) {
+    if (revealed.size > 256) revealed.delete(revealed.keys().next().value);
+    revealed.set(key, text);
+  }
+  await trace.write({ route: 'reveal', agentMessage: item.id, ok: text != null, chars: text?.length ?? 0 });
+  return text;
+}
+
+async function gptText(instructions, input) {
+  const auth = await fs.readFile(CODEX_AUTH, 'utf8').then(JSON.parse).catch(() => ({}));
+  if (!auth.tokens?.access_token) return null;
+  const model = await defaultGptModel();
+  const upstream = await fetch(`${CHATGPT_URL}/responses`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${auth.tokens.access_token}`, ...(auth.tokens.account_id ? { 'chatgpt-account-id': auth.tokens.account_id } : {}), 'content-type': 'application/json', originator: 'codex_cli_rs' },
+    body: JSON.stringify({ model, instructions, store: false, stream: true, input }),
+    signal: AbortSignal.timeout(120_000)
+  });
+  if (!upstream.ok || !upstream.body) return null;
+  let summary = null;
+  const events = new ResponseEventReader(async (response) => {
+    summary = response.output.filter((entry) => entry.type === 'message').flatMap((entry) => entry.content || []).map((part) => part.text || '').join('\n').trim() || null;
+  });
+  for await (const chunk of upstream.body) await events.push(chunk);
+  await events.push(new Uint8Array(), true);
+  return summary;
+}
+
+let codexAccessToken = null;
+async function isCodexCaller(header) {
+  const token = String(header || '').replace(/^Bearer\s+/i, '');
+  if (!token) return false;
+  if (token === codexAccessToken) return true;
+  // ChatGPT refreshes its token, so re-read auth.json on a mismatch.
+  const auth = await fs.readFile(CODEX_AUTH, 'utf8').then(JSON.parse).catch(() => ({}));
+  codexAccessToken = auth.tokens?.access_token || null;
+  return token === codexAccessToken;
+}
+
+const HOP_HEADERS = new Set(['host', 'connection', 'keep-alive', 'content-length', 'transfer-encoding', 'upgrade', 'proxy-connection', 'te', 'trailer']);
+
+// Court mode points ChatGPT's own OpenAI provider here, so every chat keeps
+// one provider and the model picker can switch freely. GPT turns go to
+// ChatGPT untouched. Other models go to the Router with the tool bridge.
+async function proxyChatGPTRequest(req, res, url) {
+  // Codex tries a WebSocket first. 426 tells it to use plain HTTP.
+  if (req.headers.upgrade) return json(res, { error: { code: 'websocket_unsupported', message: 'Court uses HTTP for Responses.' } }, 426);
+  const abort = new AbortController();
+  res.once('close', () => { if (!res.writableFinished) abort.abort(); });
+  let finishTrace = () => {};
+  try {
+    const rest = url.pathname.slice('/chatgpt'.length) || '/';
+    const raw = ['GET', 'HEAD'].includes(req.method) ? undefined : await readRawBody(req);
+    const headers = {};
+    for (const [name, value] of Object.entries(req.headers)) if (!HOP_HEADERS.has(name)) headers[name] = value;
+    let body = raw;
+    let prepared = null;
+    let traced = null;
+    if (req.method === 'POST' && ['/responses', '/responses/compact'].includes(rest)) {
+      const decoded = decodeBody(raw, req.headers['content-encoding']);
+      let request = JSON.parse(decoded.toString('utf8'));
+      const received = traceShape(request);
+      // GPT always compacts, so the chat only ever holds ChatGPT's own
+      // compacted context. Router models read it through a handoff summary.
+      const compacting = needsToolBridge(request.model) && wantsCompaction(request);
+      if (compacting) request = { ...request, model: await defaultGptModel() };
+      if (needsToolBridge(request.model)) {
+        if (!(await isCodexCaller(req.headers.authorization))) return json(res, { error: 'Unauthorized' }, 401);
+        return proxyRouterRequest(req, res, url, { pathname: `/v1${rest}`, body: decoded });
+      }
+      // Router turns leave their own item IDs and private reasoning in the
+      // chat. Clean them up before GPT sees them. History problems never
+      // block GPT: the original request is sent instead.
+      prepared = await responseHistory.prepare(request).catch(() => null);
+      if (prepared) prepared.request = unsealPlainAgentMessages(prepared.request);
+      const outgoing = prepared?.request ?? unsealPlainAgentMessages(request);
+      if (Array.isArray(request.input) && (compacting || JSON.stringify(outgoing.input) !== JSON.stringify(request.input))) {
+        body = JSON.stringify(outgoing);
+        delete headers['content-encoding'];
+      }
+      traced = { sent: outgoing, extra: { path: rest, received, historyPrepared: Boolean(prepared) } };
+    }
+    const upstream = await fetch(`${CHATGPT_URL}${rest}${url.search}`, { method: req.method, headers, body, redirect: 'manual', signal: abort.signal });
+    if (traced) finishTrace = await traceUpstream('chatgpt', traced.sent, upstream, traced.extra);
+    const responseHeaders = {};
+    // fetch has already decoded the body, so drop its encoding headers.
+    upstream.headers.forEach((value, name) => {
+      if (!HOP_HEADERS.has(name) && !['content-encoding', 'set-cookie'].includes(name)) responseHeaders[name] = value;
+    });
+    if (rest === '/responses/compact' && upstream.ok) {
+      // Keep a readable copy so a later Claude turn can expand GPT compaction.
+      const text = await upstream.text();
+      if (prepared) await responseHistory.save(prepared, JSON.parse(text), { compact: true }).catch(() => {});
+      res.writeHead(upstream.status, responseHeaders);
+      return res.end(text);
+    }
+    res.writeHead(upstream.status, responseHeaders);
+    if (!upstream.body) return res.end();
+    if (!prepared || !upstream.ok) {
+      await pipeline(Readable.fromWeb(upstream.body), res).catch(() => {});
+      return finishTrace();
+    }
+    // GPT can compact the chat inside a normal turn. Keep a readable copy so a
+    // later Router turn can replay it. History problems never break GPT.
+    let events = new ResponseEventReader((response) => responseHistory.save(prepared, response));
+    const remember = (chunk, final) => events?.push(chunk, final).catch(() => { events = null; });
+    for await (const chunk of upstream.body) {
+      finishTrace.watch?.(chunk);
+      await remember(chunk);
+      if (!res.write(chunk)) await once(res, 'drain', { signal: abort.signal });
+    }
+    await remember(new Uint8Array(), true);
+    await finishTrace();
+    res.end();
+  } catch (error) {
+    const failure = abort.signal.aborted ? 'client closed the connection' : error.message;
+    if (finishTrace.watch) await finishTrace({ failure });
+    else await trace.write({ route: 'chatgpt', path: url.pathname, failure });
     if (!res.headersSent) return json(res, { error: { code: error.code || 'proxy_error', message: error.message } }, error.status || (error.message.includes('too large') ? 413 : error instanceof SyntaxError ? 400 : 502));
     res.destroy(error);
   }
@@ -270,7 +502,7 @@ async function accounts() {
       const provider = providerFor(filename, data);
       const tokenClaims = jwtPayload(data.id_token || '');
       const authClaims = tokenClaims['https://api.openai.com/auth'] || {};
-      const quota = provider === 'Codex' ? await codexQuota(filename, data) : {};
+      const quota = provider === 'Codex' ? await codexQuota(filename, data) : provider === 'Claude' ? await claudeQuota(filename, data) : {};
       return {
         id: filename.replace(/\.json$/, ''),
         provider,
@@ -409,9 +641,20 @@ async function writeRouterProviders(providers) {
   await fs.writeFile(CONFIG, next, { mode: 0o600 });
 }
 
+async function defaultGptModel() {
+  const models = (await nativeModels()).filter((model) => model.visibility === 'list');
+  return (models.find((model) => model.slug === 'gpt-6.1-sol') || models[0])?.slug || 'gpt-6.1-sol';
+}
+
+async function nativeModels() {
+  const cache = await fs.readFile(CODEX_MODELS_CACHE, 'utf8').then(JSON.parse).catch(() => ({}));
+  return Array.isArray(cache.models) ? cache.models : [];
+}
+
 async function codexMode() {
   const config = await fs.readFile(CODEX_CONFIG, 'utf8').catch(() => '');
-  if (!/model_provider\s*=\s*["']cliproxyapi["']/.test(config)) return 'normal';
+  const court = config.includes(`openai_base_url = ${JSON.stringify(COURT_CHATGPT_URL)}`) || /model_provider\s*=\s*["']cliproxyapi["']/.test(config);
+  if (!court) return 'normal';
   return /^model\s*=\s*["']gemini-3\.7-flash-high["']/m.test(config) ? 'gemini' : 'court';
 }
 
@@ -420,7 +663,7 @@ async function setCodexMode(mode) {
   const previousMode = await codexMode();
   await fs.copyFile(CODEX_CONFIG, `${CODEX_CONFIG}.${Math.floor(Date.now() / 1000)}.bak`);
   if (mode !== 'normal' && previousMode === 'normal') {
-    const model = config.match(/^model\s*=\s*(["'][^"']*["'])/m)?.[1] || null;
+    const model = config.match(/^model\s*=\s*["']([^"']*)["']/m)?.[1] || null;
     const modelCatalogJson = config.match(/^model_catalog_json\s*=\s*(["'][^"']*["'])/m)?.[1] || null;
     await fs.writeFile(CODEX_MODE_STATE, JSON.stringify({ model, modelCatalogJson }), { mode: 0o600 });
   }
@@ -428,38 +671,54 @@ async function setCodexMode(mode) {
   config = config
     .replace(/^model_provider\s*=.*\n/m, '')
     .replace(/^model_catalog_json\s*=.*\n/m, '')
+    .replace(/^openai_base_url\s*=.*\n/m, '')
     .replace(providerBlock, '\n');
+  let normalModel;
   if (mode === 'normal') {
-    try {
-      const saved = JSON.parse(await fs.readFile(CODEX_MODE_STATE, 'utf8'));
-      if (saved.model) config = config.replace(/^model\s*=.*$/m, `model = ${saved.model}`);
-      if (saved.modelCatalogJson) config = `model_catalog_json = ${saved.modelCatalogJson}\n${config}`;
-      await fs.unlink(CODEX_MODE_STATE);
-    } catch {}
+    const saved = await fs.readFile(CODEX_MODE_STATE, 'utf8').then(JSON.parse).catch(() => ({}));
+    const restored = restoreNormalConfig(config, saved);
+    config = restored.config;
+    normalModel = restored.model;
   } else {
     const router = await verifiedRouterModels();
     if (!router.online) throw new Error(router.error);
-    await fs.writeFile(CODEX_MODEL_CATALOG, `${JSON.stringify(toCodexCatalog(router.modelDetails), null, 2)}\n`, { mode: 0o600 });
+    const catalog = toCodexCatalog(router.modelDetails, await nativeModels());
+    await fs.writeFile(CODEX_MODEL_CATALOG, `${JSON.stringify(catalog, null, 2)}\n`, { mode: 0o600 });
     if (mode === 'court') {
-      const defaultModel = router.modelDetails.find((model) => model.id === 'gpt-6.1-sol') || router.modelDetails.find((model) => model.ownedBy === 'openai');
-      if (!defaultModel) throw new Error('Connect a ChatGPT account before enabling Court models.');
-      if (/^model\s*=/m.test(config)) config = config.replace(/^model\s*=.*$/m, `model = ${JSON.stringify(defaultModel.id)}`);
-      else config = `model = ${JSON.stringify(defaultModel.id)}\n${config}`;
+      const gpt = catalog.models.filter((model) => !needsToolBridge(model.slug) && model.visibility === 'list');
+      const defaultModel = gpt.find((model) => model.slug === 'gpt-6.1-sol') || gpt[0];
+      if (!defaultModel) throw new Error('Sign in to ChatGPT before enabling Court models.');
+      if (/^model\s*=/m.test(config)) config = config.replace(/^model\s*=.*$/m, `model = ${JSON.stringify(defaultModel.slug)}`);
+      else config = `model = ${JSON.stringify(defaultModel.slug)}\n${config}`;
     }
     if (mode === 'gemini') {
       if (/^model\s*=/m.test(config)) config = config.replace(/^model\s*=.*$/m, 'model = "gemini-3.7-flash-high"');
       else config = `model = "gemini-3.7-flash-high"\n${config}`;
     }
     const firstLineEnd = config.indexOf('\n') + 1;
-    config = `${config.slice(0, firstLineEnd)}model_provider = "cliproxyapi"\nmodel_catalog_json = ${JSON.stringify(CODEX_MODEL_CATALOG)}\n${config.slice(firstLineEnd).replace(/^\n+/, '')}`;
+    // Every chat stays on ChatGPT's own provider. Court picks the backend per
+    // turn, so switching between GPT and Router models never strands a chat.
+    config = `${config.slice(0, firstLineEnd)}model_provider = "openai"\nopenai_base_url = ${JSON.stringify(COURT_CHATGPT_URL)}\nmodel_catalog_json = ${JSON.stringify(CODEX_MODEL_CATALOG)}\n${config.slice(firstLineEnd).replace(/^\n+/, '')}`;
+    // Chats from older Court versions remember this provider ID.
     config = `${config.trimEnd()}\n\n[model_providers.cliproxyapi]\nname = "Court Router"\nbase_url = "${COURT_API_URL}"\nenv_key = "CLIPROXYAPI_API_KEY"\nwire_api = "responses"\nrequires_openai_auth = true\n`;
   }
   await fs.writeFile(CODEX_CONFIG, config, { mode: 0o600 });
+  return normalModel;
 }
 
-async function restartChatGPT(mode) {
+async function restartChatGPT(mode, normalModel) {
   const key = mode === 'normal' ? '' : await apiKey();
-  await restartMacChatGPT(mode, key);
+  const backupDir = path.join(STATE_DIR, 'chat-index-backups');
+  await restartMacChatGPT(mode, key, async () => {
+    if (mode === 'normal') {
+      await restoreNativeCourtChats(normalModel, { backupDir });
+      await fs.unlink(CODEX_MODE_STATE).catch(() => {});
+    } else {
+      // Chats an older Court rewrote cannot be edited until Codex rebuilds
+      // their index. ChatGPT is closed here, so it is safe to reset them.
+      await repairThreadHistory({ backupDir }).catch(() => {});
+    }
+  });
 }
 
 const server = http.createServer(async (req, res) => {
@@ -470,12 +729,15 @@ const server = http.createServer(async (req, res) => {
     if (!key || req.headers.authorization !== `Bearer ${key}`) return json(res, { error: 'Unauthorized' }, 401);
     const router = await verifiedRouterModels();
     if (!router.online) return json(res, { error: router.error }, 503);
-    return json(res, toCodexCatalog(router.modelDetails));
+    return json(res, toCodexCatalog(router.modelDetails, await nativeModels()));
   }
   if (url.pathname.startsWith('/v1/')) return proxyRouterRequest(req, res, url);
+  if (url.pathname === '/chatgpt' || url.pathname.startsWith('/chatgpt/')) return proxyChatGPTRequest(req, res, url);
   if (url.pathname === '/api/overview') return json(res, await overview());
-  if (url.pathname === '/api/codex-mode' && req.method === 'GET') return json(res, { mode: await codexMode() });
+  if (url.pathname === '/api/codex-mode' && req.method === 'GET') return json(res, { mode: await codexMode(), switching: changingCodexMode });
   if (url.pathname === '/api/codex-mode' && req.method === 'POST') {
+    if (changingCodexMode) return json(res, { error: 'ChatGPT is already switching models. Wait for it to reopen.' }, 409);
+    changingCodexMode = true;
     try {
       const mode = (await readJsonBody(req)).mode;
       if (!['court', 'gemini', 'normal'].includes(mode)) throw new Error('Unknown Codex mode');
@@ -484,12 +746,13 @@ const server = http.createServer(async (req, res) => {
         if (!router.online) throw new Error('Router is offline. Start it before launching Codex.');
         if (mode === 'gemini' && !router.models.includes('gemini-3.7-flash-high')) throw new Error('Gemini 3.7 Flash is not available in the current router pool.');
       }
-      await setCodexMode(mode);
+      const normalModel = await setCodexMode(mode);
+      await restartChatGPT(mode, normalModel);
       const message = mode === 'gemini' ? 'Restarting Codex with Gemini 3.7 Flash.' : mode === 'court' ? 'Restarting Codex with Court models.' : 'Restoring your normal ChatGPT account.';
       json(res, { ok: true, mode, message });
-      setTimeout(() => restartChatGPT(mode).catch(() => {}), 700);
       return;
     } catch (error) { return json(res, { error: error.message }, 400); }
+    finally { changingCodexMode = false; }
   }
   if (url.pathname === '/api/custom-providers' && req.method === 'GET') {
     const providers = await readCustomProviders();

@@ -123,6 +123,16 @@ test('SSE captures completed responses across Unicode and CRLF chunk boundaries 
   const truncated = new ResponseEventReader(async () => assert.fail('must not commit'));
   await truncated.push(Buffer.from('data: {"type":"response.completed"'));
   await assert.rejects(truncated.push(new Uint8Array(), true), { code: 'incomplete_stream' });
+  // ChatGPT leaves `output` empty on completion and streams each item instead.
+  const native = [];
+  const nativeReader = new ResponseEventReader(async (value) => { native.push(value); });
+  const compaction = { type: 'compaction', id: 'cmp', encrypted_content: 'opaque' };
+  await nativeReader.push(Buffer.from([
+    { type: 'response.output_item.done', output_index: 1, item: compaction },
+    { type: 'response.output_item.done', output_index: 0, item: message('assistant', 'first') },
+    { type: 'response.completed', response: { id: 'native', status: 'completed', output: [] } }
+  ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join('')));
+  assert.deepEqual(native[0].output, [message('assistant', 'first'), compaction]);
   const oversized = new ResponseEventReader(async () => {}, { maxEventBytes: 5 });
   await assert.rejects(oversized.push(Buffer.from('data: 123456\n\n')), { code: 'response_too_large' });
 });
@@ -138,4 +148,23 @@ test('reasoning provenance survives snapshot eviction for an ongoing full-histor
   const third = await restarted.prepare({ model: 'gpt-6.1-sol', previous_response_id: 'second', input: 'continue again' });
   assert(!third.request.input.some((item) => item.type === 'reasoning'));
   assert(third.request.input.some((item) => item.content === 'Claude answer'));
+});
+
+test('opaque compaction gets a handoff summary from its provider, cached, with replay as the fallback', async (t) => {
+  let asked = 0;
+  const { history } = await fixture(t, { handoff: async (item) => { asked++; return item.encrypted_content === 'known' ? 'GPT says: ship it.' : null; } });
+  const unknownToCourt = { type: 'compaction', encrypted_content: 'known' };
+  for (let turn = 0; turn < 2; turn++) {
+    const next = await history.prepare({ model: 'claude-sonnet-4-6', input: [unknownToCourt, message('user', 'go')] });
+    assert.equal(next.request.input[0].content[0].text, 'Summary of the earlier conversation:\n\nGPT says: ship it.');
+  }
+  assert.equal(asked, 1);
+  const restarted = new ResponseHistory(history.directory, { handoff: async () => assert.fail('summary should come from disk') });
+  const again = await restarted.prepare({ model: 'claude-sonnet-4-6', input: [unknownToCourt] });
+  assert.match(again.request.input[0].content[0].text, /ship it/);
+  const prepared = await history.prepare({ model: 'gpt-6.1-sol', input: [message('user', 'Original')] });
+  const saved = { type: 'compaction', encrypted_content: 'saved-only' };
+  await history.save(prepared, { id: 'c', output: [saved] }, { compact: true });
+  const replayed = await history.prepare({ model: 'claude-sonnet-4-6', input: [saved] });
+  assert.deepEqual(replayed.request.input, [message('user', 'Original')]);
 });

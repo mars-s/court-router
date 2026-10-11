@@ -75,3 +75,15 @@ test('advertised Claude text models are included without a fixed version allowli
     'Claude Opus 4.6', 'Claude Opus 5.5', 'Claude Sonnet 5.5', 'Claude Haiku 4.5', 'Claude Opus 6.2'
   ]);
 });
+
+test('keeps native ChatGPT entries as they are and adds only missing Router models', () => {
+  const native = [{ slug: 'gpt-6.1-sol', tool_mode: 'code_mode_only', multi_agent_version: 'v2' }];
+  const catalog = toCodexCatalog([
+    { id: 'gpt-6.1-sol', ownedBy: 'openai' },
+    { id: 'claude-opus-5-5', ownedBy: 'anthropic' }
+  ], native);
+  assert.deepEqual(catalog.models.map((model) => model.slug), ['gpt-6.1-sol', 'claude-opus-5-5']);
+  assert.equal(catalog.models[0], native[0]);
+  assert.equal(catalog.models[1].priority, 2);
+  assert.equal(catalog.models[1].context_window, 200000);
+});

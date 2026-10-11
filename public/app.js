@@ -206,29 +206,47 @@ async function removeProvider(prefix) {
   } catch (error) { showToast(error.message); }
 }
 
+// The switch always shows what the Codex config says, so a change made from
+// another tab or by hand shows up when this page next checks.
+let codexMode = null;
+
+function renderCodexMode(mode, switching = false) {
+  codexMode = mode;
+  const on = mode === 'court' || mode === 'gemini';
+  const card = qs('#codex-switch');
+  card.classList.toggle('is-on', on);
+  card.classList.toggle('is-switching', switching);
+  const toggle = qs('#court-toggle');
+  toggle.setAttribute('aria-checked', String(on));
+  toggle.disabled = switching || !mode;
+  qs('#court-toggle-state').textContent = switching ? 'Switching' : on ? 'On' : 'Off';
+  qs('#codex-mode-copy').textContent = switching
+    ? 'Restarting ChatGPT. Your chats are being moved over.'
+    : mode === 'gemini' ? 'Using Gemini 3.7 Flash through your Antigravity pool'
+      : mode === 'court' ? 'GPT and Claude in the same chat. Switch models any time.'
+        : mode === 'normal' ? 'Plain ChatGPT. Turn on to add Claude and other models.'
+          : 'Could not read Codex configuration';
+}
+
 async function loadCodexMode() {
   try {
-    const response = await fetch('/api/codex-mode');
-    const { mode } = await response.json();
-    qs('#codex-mode-copy').textContent = mode === 'gemini'
-      ? 'Using Gemini 3.7 Flash through your Antigravity pool'
-      : mode === 'court'
-        ? 'ChatGPT stays signed in. Choose GPT or Claude in the same chat'
-        : 'Using your normal ChatGPT account';
-    qsa('[data-mode]').forEach((button) => button.classList.toggle('active', button.dataset.mode === mode));
-  } catch { qs('#codex-mode-copy').textContent = 'Could not read Codex configuration'; }
+    const { mode, switching } = await (await fetch('/api/codex-mode')).json();
+    renderCodexMode(mode, switching);
+  } catch { renderCodexMode(null); }
 }
 
 async function changeCodexMode(mode) {
-  const label = mode === 'gemini' ? 'Gemini 3.7 Flash' : mode === 'court' ? 'ChatGPT and Claude through Court' : 'your normal ChatGPT account';
+  const label = mode === 'court' ? 'GPT and Claude through Court' : 'plain ChatGPT';
   if (!confirm(`Restart the Codex App using ${label}? Any running tasks will be interrupted.`)) return;
-  qsa('[data-mode]').forEach((button) => { button.disabled = true; });
+  const previous = codexMode;
+  renderCodexMode(mode, true);
   try {
     const response = await fetch('/api/codex-mode', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ mode }) });
     const body = await response.json();
     if (!response.ok) throw new Error(body.error);
     showToast(body.message);
-  } catch (error) { showToast(error.message); qsa('[data-mode]').forEach((button) => { button.disabled = false; }); }
+  } catch (error) { renderCodexMode(previous); showToast(error.message); }
+  finally { await loadCodexMode(); }
 }
 
 function showView(name, { updateHash = true } = {}) {
@@ -244,12 +262,13 @@ qs('#refresh').addEventListener('click', refresh);
 qs('#refresh-logs').addEventListener('click', loadLogs);
 qs('#endpoint-form').addEventListener('submit', saveEndpoint);
 qsa('.close-modal,.cancel-modal').forEach((button) => button.addEventListener('click', () => qs('#endpoint-dialog').close()));
-qsa('[data-mode]').forEach((button) => button.addEventListener('click', () => changeCodexMode(button.dataset.mode)));
+qs('#court-toggle').addEventListener('click', () => changeCodexMode(codexMode === 'normal' ? 'court' : 'normal'));
+document.addEventListener('visibilitychange', () => { if (!document.hidden) loadCodexMode(); });
 qs('#local-address').textContent = location.host;
 
 const rate = qs('#refresh-rate');
 rate.value = localStorage.getItem('court-refresh-rate') || '30';
-function scheduleRefresh() { clearInterval(refreshTimer); refreshTimer = setInterval(refresh, Number(rate.value) * 1000); }
+function scheduleRefresh() { clearInterval(refreshTimer); refreshTimer = setInterval(() => { refresh(); loadCodexMode(); }, Number(rate.value) * 1000); }
 rate.addEventListener('change', () => { localStorage.setItem('court-refresh-rate', rate.value); scheduleRefresh(); showToast('Refresh setting saved'); });
 
 const initialView = ['overview', 'manage', 'logs', 'settings'].includes(location.hash.slice(1)) ? location.hash.slice(1) : 'overview';
