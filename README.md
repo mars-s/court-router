@@ -196,6 +196,18 @@ has read. Court's cleanup of older chat files makes those files shorter, so
 Court now resets that chat's index at the same time, saving the removed rows
 under `chat-index-backups` in Court's state folder.
 
+## Benchmark
+
+`npm run bench` runs real chats through the Codex engine bundled with the
+ChatGPT app, so each turn takes the same path as one typed into the app. It
+checks every model and every ordered pair of models in parallel, and takes
+about a minute for two models. See [docs/benchmark.md](docs/benchmark.md)
+for the full list of checks, options and what a failure means.
+
+After a ChatGPT update, run it first. It starts by checking that the app
+still has every engine method, event and field Court relies on, and names
+the missing piece if not.
+
 ## License
 
 Court is available under the MIT License. Provider logos remain subject to their owners' trademark rules. See `THIRD_PARTY_NOTICES.md` and `docs/logo-sources.md`.

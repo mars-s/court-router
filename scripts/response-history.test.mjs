@@ -182,3 +182,34 @@ test('Claude gets back the web search results Codex drops from its history', asy
   const gpt = await history.prepare({ model: 'gpt-6.1-sol', input: [ask, replayed] });
   assert.equal('results' in gpt.request.input[1], false);
 });
+
+test('Claude retries a search that never ran because it paused for another tool', async (t) => {
+  const { history } = await fixture(t);
+  const ask = message('user', 'Get the time and search the weather.');
+  const first = await history.prepare({ model: 'claude-sonnet-5', input: [ask] });
+  const call = { type: 'function_call', id: 'fc_1', call_id: 'toolu_1', name: 'get_time', arguments: '{}' };
+  const search = { type: 'web_search_call', id: 'ws_srvtoolu_1', status: 'completed', action: { type: 'search', query: 'weather' } };
+  await history.save(first, reply('resp-paused', [call, search]));
+  const output = { type: 'function_call_output', call_id: 'toolu_1', output: '20:15' };
+  const next = await history.prepare({ model: 'claude-sonnet-5', input: [ask, call, search, output] });
+  assert.deepEqual(next.request.input.map((item) => item.type), ['message', 'function_call', 'function_call_output']);
+  // GPT history is left alone.
+  const gpt = await history.prepare({ model: 'gpt-6.1-sol', input: [ask, { ...search, id: 'ws_gpt' }] });
+  assert.equal(gpt.request.input.length, 2);
+});
+
+test('Claude search history keeps real results, even empty ones, across a restart', async (t) => {
+  const { directory, history } = await fixture(t);
+  const ask = message('user', 'Search.');
+  const first = await history.prepare({ model: 'claude-sonnet-5', input: [ask] });
+  const empty = { type: 'web_search_call', id: 'ws_empty', status: 'completed', action: { type: 'search', query: 'nothing' }, results: [] };
+  const deferred = { type: 'web_search_call', id: 'ws_future_format', status: 'completed', action: { type: 'search', query: 'later' } };
+  await history.save(first, reply('resp-1', [empty, deferred]));
+  const restarted = new ResponseHistory(directory);
+  const stranger = { type: 'web_search_call', id: 'ws_unknown', status: 'completed', action: { type: 'search', query: 'x' } };
+  const next = await restarted.prepare({ model: 'claude-sonnet-5', input: [ask, empty, deferred, stranger] });
+  // A real empty result stays. A no-results search Court saw Claude make is
+  // dropped whatever its ID looks like. One Court never saw is left alone.
+  assert.deepEqual(next.request.input.filter((i) => i.type === 'web_search_call').map((i) => i.action.query), ['nothing', 'x']);
+  assert.deepEqual(next.request.input[1].results, []);
+});
