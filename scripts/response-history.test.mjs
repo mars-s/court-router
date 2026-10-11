@@ -168,3 +168,17 @@ test('opaque compaction gets a handoff summary from its provider, cached, with r
   const replayed = await history.prepare({ model: 'claude-sonnet-4-6', input: [saved] });
   assert.deepEqual(replayed.request.input, [message('user', 'Original')]);
 });
+
+test('Claude gets back the web search results Codex drops from its history', async (t) => {
+  const { history } = await fixture(t);
+  const ask = message('user', 'Search the weather.');
+  const first = await history.prepare({ model: 'claude-sonnet-5', input: [ask] });
+  const results = [{ type: 'web_search_result', title: 'Forecast', url: 'https://example.com', encrypted_content: 'sealed-page' }];
+  await history.save(first, reply('resp-search', [{ type: 'web_search_call', id: 'ws_1', status: 'completed', action: { type: 'search', query: 'weather' }, results }]));
+  // Codex replays the call with its action only.
+  const replayed = { type: 'web_search_call', id: 'ws_1', status: 'completed', action: { type: 'search', query: 'weather' } };
+  const next = await history.prepare({ model: 'claude-sonnet-5', input: [ask, replayed, message('user', 'What did you find?')] });
+  assert.deepEqual(next.request.input[1].results, results);
+  const gpt = await history.prepare({ model: 'gpt-6.1-sol', input: [ask, replayed] });
+  assert.equal('results' in gpt.request.input[1], false);
+});
