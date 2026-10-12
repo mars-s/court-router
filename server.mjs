@@ -355,8 +355,18 @@ async function proxyRouterRequest(req, res, url, routed = null) {
 // GPT summarises its own compacted context for the next model, using the
 // signed-in ChatGPT account. Returns null when that is not possible.
 async function gptHandoff(item) {
-  return gptText('You write handoff summaries so another model can continue a conversation.',
-    [{ type: 'compaction', encrypted_content: item.encrypted_content }, { type: 'message', role: 'user', content: [{ type: 'input_text', text: HANDOFF_PROMPT }] }]);
+  const started = Date.now();
+  const carrier = createHash('sha256').update(item.encrypted_content).digest('hex').slice(0, 12);
+  try {
+    // A long chat takes GPT one to two minutes to summarise.
+    const summary = await gptText('You write handoff summaries so another model can continue a conversation.',
+      [{ type: 'compaction', encrypted_content: item.encrypted_content }, { type: 'message', role: 'user', content: [{ type: 'input_text', text: HANDOFF_PROMPT }] }], { timeoutMs: 300_000 });
+    await trace.write({ route: 'handoff', carrier, ok: Boolean(summary), chars: summary?.length ?? 0, ms: Date.now() - started });
+    return summary;
+  } catch (error) {
+    await trace.write({ route: 'handoff', carrier, ok: false, failure: error.message, ms: Date.now() - started });
+    throw error;
+  }
 }
 
 // A GPT parent seals subagent task text so only GPT can read it. Claude
@@ -365,29 +375,30 @@ const revealed = new Map();
 async function gptRevealAgentMessage(item) {
   const key = createHash('sha256').update(item.content[0].encrypted_content).digest('hex');
   if (revealed.has(key)) return revealed.get(key);
+  let failure;
   const text = await gptText(`You are ${item.recipient || 'a subagent'}. Your teammate on another model will do the task you were just assigned, so you are handing it over. Output the task payload you received, word for word, with nothing added.`, [
     item,
     { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Hand over the task now: write the payload you were sent, verbatim.' }] }
-  ]);
+  ]).catch((error) => { failure = error.message; return null; });
   if (text != null) {
     if (revealed.size > 256) revealed.delete(revealed.keys().next().value);
     revealed.set(key, text);
   }
-  await trace.write({ route: 'reveal', agentMessage: item.id, ok: text != null, chars: text?.length ?? 0 });
+  await trace.write({ route: 'reveal', agentMessage: item.id, ok: text != null, chars: text?.length ?? 0, ...(failure ? { failure } : {}) });
   return text;
 }
 
-async function gptText(instructions, input) {
+async function gptText(instructions, input, { timeoutMs = 120_000 } = {}) {
   const auth = await fs.readFile(CODEX_AUTH, 'utf8').then(JSON.parse).catch(() => ({}));
-  if (!auth.tokens?.access_token) return null;
+  if (!auth.tokens?.access_token) throw new Error('ChatGPT is not signed in');
   const model = await defaultGptModel();
   const upstream = await fetch(`${CHATGPT_URL}/responses`, {
     method: 'POST',
     headers: { authorization: `Bearer ${auth.tokens.access_token}`, ...(auth.tokens.account_id ? { 'chatgpt-account-id': auth.tokens.account_id } : {}), 'content-type': 'application/json', originator: 'codex_cli_rs' },
     body: JSON.stringify({ model, instructions, store: false, stream: true, input }),
-    signal: AbortSignal.timeout(120_000)
+    signal: AbortSignal.timeout(timeoutMs)
   });
-  if (!upstream.ok || !upstream.body) return null;
+  if (!upstream.ok || !upstream.body) throw new Error(`ChatGPT returned ${upstream.status}: ${(await upstream.text().catch(() => '')).slice(0, 200)}`);
   let summary = null;
   const events = new ResponseEventReader(async (response) => {
     summary = response.output.filter((entry) => entry.type === 'message').flatMap((entry) => entry.content || []).map((part) => part.text || '').join('\n').trim() || null;

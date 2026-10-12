@@ -169,6 +169,30 @@ test('opaque compaction gets a handoff summary from its provider, cached, with r
   assert.deepEqual(replayed.request.input, [message('user', 'Original')]);
 });
 
+test('GPT compaction starts its handoff summary at once, and keeps its readable copy longest', async (t) => {
+  let finish;
+  const asked = [];
+  const { history } = await fixture(t, { maxEntries: 3, handoff: (item) => { asked.push(item.encrypted_content); return asked.length > 1 ? null : new Promise((resolve) => { finish = resolve; }); } });
+  const original = [message('user', 'A long chat worth keeping.')];
+  const prepared = await history.prepare({ model: 'gpt-6.1-sol', input: original });
+  const compacted = { type: 'compaction', encrypted_content: 'slow-to-summarise' };
+  await history.save(prepared, reply('compact', [compacted]));
+  for (let tick = 0; tick < 50 && !asked.length; tick++) await new Promise((resolve) => setTimeout(resolve, 2));
+  assert.deepEqual(asked, ['slow-to-summarise'], 'summary starts when GPT compacts, before any Claude turn');
+  for (let turn = 0; turn < 5; turn++) {
+    const next = await history.prepare({ model: 'claude-sonnet-4-6', input: [message('user', `turn ${turn}`)] });
+    await history.save(next, reply(`claude-${turn}`, [message('assistant', 'ok')]));
+  }
+  assert(history.records.has('compact'), 'newer ordinary turns are evicted first');
+  finish(null);
+  await new Promise((resolve) => setImmediate(resolve));
+  const replayed = await history.prepare({ model: 'claude-sonnet-4-6', input: [compacted, message('user', 'go on')] });
+  assert.deepEqual(replayed.request.input, [...original, message('user', 'go on')]);
+  const restarted = new ResponseHistory(history.directory, { maxEntries: 3 });
+  await restarted.load();
+  assert(restarted.records.has('compact'), 'a restart keeps the compaction copy too');
+});
+
 test('Claude gets back the web search results Codex drops from its history', async (t) => {
   const { history } = await fixture(t);
   const ask = message('user', 'Search the weather.');
