@@ -85,5 +85,17 @@ test('keeps native ChatGPT entries as they are and adds only missing Router mode
   assert.deepEqual(catalog.models.map((model) => model.slug), ['gpt-6.1-sol', 'claude-opus-5-5']);
   assert.equal(catalog.models[0], native[0]);
   assert.equal(catalog.models[1].priority, 2);
-  assert.equal(catalog.models[1].context_window, 200000);
+  assert.equal(catalog.models[1].context_window, 1000000);
+});
+
+test('gives Opus 5.5 its full 1M window and other Claude models 200k', () => {
+  const catalog = toCodexCatalog([
+    { id: 'claude-opus-5-5', ownedBy: 'anthropic' },
+    { id: 'claude-opus-5-5-thinking', ownedBy: 'anthropic' },
+    { id: 'claude-sonnet-5', ownedBy: 'anthropic' },
+    { id: 'gemini-3-flash', ownedBy: 'google' }
+  ]);
+  assert.deepEqual(catalog.models.map((model) => [model.context_window, model.max_context_window]), [
+    [1000000, 1000000], [1000000, 1000000], [200000, 200000], [128000, 128000]
+  ]);
 });

@@ -890,4 +890,22 @@ const server = http.createServer(async (req, res) => {
   return json(res, { error: 'Not found' }, 404);
 });
 
-server.listen(PORT, HOST, () => console.log(`Court is running at http://${HOST}:${PORT}`));
+// ChatGPT reads the saved catalogue file, so refresh it on start. Otherwise a
+// catalogue change (such as a larger context window) waits for a mode switch.
+async function refreshSavedCatalog() {
+  if (await codexMode() === 'normal') return;
+  const router = await verifiedRouterModels();
+  if (!router.online) return;
+  const catalog = toCodexCatalog(router.modelDetails, await nativeModels());
+  const next = `${JSON.stringify(catalog, null, 2)}\n`;
+  if (await fs.readFile(CODEX_MODEL_CATALOG, 'utf8').catch(() => '') === next) return;
+  const temp = `${CODEX_MODEL_CATALOG}.${process.pid}.tmp`;
+  await fs.writeFile(temp, next, { mode: 0o600 });
+  await fs.rename(temp, CODEX_MODEL_CATALOG);
+  console.log('Refreshed the saved ChatGPT model catalogue');
+}
+
+server.listen(PORT, HOST, () => {
+  console.log(`Court is running at http://${HOST}:${PORT}`);
+  refreshSavedCatalog().catch((error) => console.error(`Could not refresh the model catalogue: ${error.message}`));
+});
