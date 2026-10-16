@@ -17,6 +17,7 @@ import { repairThreadHistory } from './lib/thread-history.mjs';
 import { bridgeRequest, needsToolBridge, restoreResponse, ToolBridgeStream } from './lib/tool-bridge.mjs';
 import { HANDOFF_PROMPT, wantsCompaction } from './lib/handoff.mjs';
 import { claudeWindow } from './lib/claude-usage.mjs';
+import { fitImageBudget } from './lib/image-budget.mjs';
 import { StreamOutcome, Trace, traceShape } from './lib/trace.mjs';
 import { revealSealedAgentMessages, unsealPlainAgentMessages } from './lib/agent-messages.mjs';
 import { createHash } from 'node:crypto';
@@ -304,8 +305,10 @@ async function proxyRouterRequest(req, res, url, routed = null) {
       prepared.request = await revealSealedAgentMessages(prepared.request, gptRevealAgentMessage);
       const bridged = bridgeRequest(prepared.request);
       bridge = bridged.state;
-      body = JSON.stringify(bridged.request);
-      traced = { sent: bridged.request, extra: { path: pathname, received: traceShape(received) } };
+      // Claude rejects requests over ~32 MB, so shrink or drop old images.
+      const fitted = await fitImageBudget(bridged.request);
+      body = JSON.stringify(fitted.request);
+      traced = { sent: fitted.request, extra: { path: pathname, received: traceShape(received), ...(fitted.stats ? { images: fitted.stats } : {}) } };
     }
     const upstream = await fetch(`${ROUTER_URL}${pathname}${url.search}`, {
       method: req.method,
