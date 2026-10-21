@@ -7,7 +7,7 @@
   "bin": { "court": "./court" },
   "scripts": {
     "start": "node server.mjs",
-    "check": "node --check server.mjs && node --check public/app.js && node --check lib/response-history.mjs && node --check lib/tool-bridge.mjs && node --check lib/handoff.mjs && node --check lib/chat-cleanup.mjs && node --check lib/claude-usage.mjs && node --check lib/thread-history.mjs && node --check lib/trace.mjs && node --check lib/image-budget.mjs && node --check scripts/bench/run.mjs && node --check scripts/bench/client.mjs && node --check scripts/bench/drift.mjs",
+    "check": "node --check server.mjs && node --check public/app.js && node --check lib/response-history.mjs && node --check lib/tool-bridge.mjs && node --check lib/handoff.mjs && node --check lib/chat-cleanup.mjs && node --check lib/claude-usage.mjs && node --check lib/thread-history.mjs && node --check lib/trace.mjs && node --check lib/image-budget.mjs && node --check lib/annotations.mjs && node --check scripts/bench/run.mjs && node --check scripts/bench/client.mjs && node --check scripts/bench/drift.mjs",
     "test": "node --test scripts/*.test.mjs",
     "bench": "node scripts/bench/run.mjs",
     "security": "node scripts/security-check.mjs"

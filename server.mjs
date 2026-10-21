@@ -18,6 +18,7 @@ import { bridgeRequest, needsToolBridge, restoreResponse, ToolBridgeStream } fro
 import { HANDOFF_PROMPT, wantsCompaction } from './lib/handoff.mjs';
 import { claudeWindow } from './lib/claude-usage.mjs';
 import { fitImageBudget } from './lib/image-budget.mjs';
+import { normaliseAnnotations } from './lib/annotations.mjs';
 import { StreamOutcome, Trace, traceShape } from './lib/trace.mjs';
 import { revealSealedAgentMessages, unsealPlainAgentMessages } from './lib/agent-messages.mjs';
 import { createHash } from 'node:crypto';
@@ -457,8 +458,8 @@ async function proxyChatGPTRequest(req, res, url) {
       // chat. Clean them up before GPT sees them. History problems never
       // block GPT: the original request is sent instead.
       prepared = await responseHistory.prepare(request).catch(() => null);
-      if (prepared) prepared.request = unsealPlainAgentMessages(prepared.request);
-      const outgoing = prepared?.request ?? unsealPlainAgentMessages(request);
+      if (prepared) prepared.request = normaliseAnnotations(unsealPlainAgentMessages(prepared.request));
+      const outgoing = prepared?.request ?? normaliseAnnotations(unsealPlainAgentMessages(request));
       if (Array.isArray(request.input) && (compacting || JSON.stringify(outgoing.input) !== JSON.stringify(request.input))) {
         body = JSON.stringify(outgoing);
         delete headers['content-encoding'];
