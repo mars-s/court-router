@@ -46,6 +46,7 @@ const CODEX_MODEL_CATALOG = path.join(STATE_DIR, 'codex-model-catalog.json');
 const CODEX_MODELS_CACHE = process.env.COURT_CODEX_MODELS_CACHE || path.join(HOME, '.codex', 'models_cache.json');
 const GEMINI_CREDENTIALS = process.env.COURT_GEMINI_CREDENTIALS || path.join(HOME, '.gemini', 'oauth_creds.json');
 const MAX_BODY_BYTES = 32 * 1024;
+const CLAUDE_MAX_OUTPUT_TOKENS = 128000;
 const MAX_PROXY_BODY_BYTES = 256 * 1024 * 1024;
 const quotaCache = new Map();
 let changingCodexMode = false;
@@ -307,6 +308,11 @@ async function proxyRouterRequest(req, res, url, routed = null) {
       const bridged = bridgeRequest(prepared.request);
       bridge = bridged.state;
       // Claude rejects requests over ~32 MB, so shrink or drop old images.
+      // The Router caps Claude output at 32,000 tokens when no limit is sent, which
+      // cuts long tool calls off mid-argument ("max_output_tokens"). Ask for more.
+      if (/^claude-/i.test(String(bridged.request.model)) && !bridged.request.max_output_tokens) {
+        bridged.request.max_output_tokens = CLAUDE_MAX_OUTPUT_TOKENS;
+      }
       const fitted = await fitImageBudget(bridged.request);
       body = JSON.stringify(fitted.request);
       traced = { sent: fitted.request, extra: { path: pathname, received: traceShape(received), ...(fitted.stats ? { images: fitted.stats } : {}) } };
