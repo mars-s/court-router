@@ -308,7 +308,7 @@ async function proxyRouterRequest(req, res, url, routed = null) {
       const bridged = bridgeRequest(prepared.request);
       bridge = bridged.state;
       // Claude rejects requests over ~32 MB, so shrink or drop old images.
-      // The Router caps Claude output at 32,000 tokens when no limit is sent, which
+      // Without an explicit limit the Router applies a smaller default output cap, which
       // cuts long tool calls off mid-argument ("max_output_tokens"). Ask for more.
       if (/^claude-/i.test(String(bridged.request.model)) && !bridged.request.max_output_tokens) {
         bridged.request.max_output_tokens = CLAUDE_MAX_OUTPUT_TOKENS;
