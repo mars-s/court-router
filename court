@@ -47,8 +47,59 @@ case "${1:-help}" in
       *) echo "Usage: court connect {codex|claude|antigravity|gemini|grok|kimi}"; exit 2 ;;
     esac
     ;;
+  claude)
+    # The Claude workflow: the Claude desktop app in gateway mode, on the same Router.
+    CLAUDE_LABEL="com.court.claude-websearch-relay"
+    CLAUDE_PLIST="$HOME/Library/LaunchAgents/$CLAUDE_LABEL.plist"
+    case "${2:-}" in
+      config) exec /usr/bin/env node "$ROOT/claude/config.mjs" ;;
+      relay)
+        case "${3:-run}" in
+          run) exec /usr/bin/env node "$ROOT/claude/websearch-relay.mjs" ;;
+          install)
+            NODE="$(command -v node)"
+            mkdir -p "$HOME/Library/LaunchAgents"
+            cat > "$CLAUDE_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>$CLAUDE_LABEL</string>
+<key>ProgramArguments</key><array><string>$NODE</string><string>$ROOT/claude/websearch-relay.mjs</string></array>
+<key>EnvironmentVariables</key><dict><key>COURT_STATE_DIR</key><string>$COURT_STATE_DIR</string></dict>
+<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+<key>StandardErrorPath</key><string>$COURT_STATE_DIR/claude-relay.log</string>
+</dict></plist>
+PLIST
+            launchctl bootout "gui/$(id -u)/$CLAUDE_LABEL" 2>/dev/null || true
+            launchctl bootstrap "gui/$(id -u)" "$CLAUDE_PLIST"
+            echo "Web search relay installed; it starts at login. Log: $COURT_STATE_DIR/claude-relay.log"
+            ;;
+          uninstall)
+            launchctl bootout "gui/$(id -u)/$CLAUDE_LABEL" 2>/dev/null || true
+            rm -f "$CLAUDE_PLIST"
+            echo "Web search relay removed"
+            ;;
+          *) echo "Usage: court claude relay {run|install|uninstall}"; exit 2 ;;
+        esac
+        ;;
+      app)
+        APP="/Applications/Claude (Gateway).app"
+        DATA="$HOME/Library/Application Support/Claude-Gateway"
+        osacompile -o "$APP" -e "do shell script \"open -n -a \\\"/Applications/Claude.app\\\" --args --user-data-dir=\\\"$DATA\\\" > /dev/null 2>&1 &\""
+        cp /Applications/Claude.app/Contents/Resources/electron.icns "$APP/Contents/Resources/applet.icns"
+        touch "$APP"
+        echo "Created $APP. Run 'court claude config' before opening it."
+        ;;
+      status)
+        if launchctl print "gui/$(id -u)/$CLAUDE_LABEL" >/dev/null 2>&1; then echo "Web search relay: running"; else echo "Web search relay: not installed"; fi
+        [[ -d "/Applications/Claude (Gateway).app" ]] && echo "Claude (Gateway) app: installed" || echo "Claude (Gateway) app: not installed"
+        [[ -f "$COURT_STATE_DIR/claude.json" ]] && echo "Settings: $COURT_STATE_DIR/claude.json" || echo "Settings: defaults (no $COURT_STATE_DIR/claude.json)"
+        ;;
+      *) echo "Usage: court claude {config|relay [run|install|uninstall]|app|status}"; exit 2 ;;
+    esac
+    ;;
   *)
     echo "Court, a local Router account dashboard"
-    echo "Usage: court {up|down|status|open|connect <codex|claude|antigravity|gemini|grok|kimi>}"
+    echo "Usage: court {up|down|status|open|connect <codex|claude|antigravity|gemini|grok|kimi>|claude <config|relay|app|status>}"
     ;;
 esac

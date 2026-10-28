@@ -140,6 +140,22 @@ After connecting any OpenRouter endpoint, Manage can reuse that stored key to ad
 model for each request. The Auto router is task-aware and charges the rate of the
 model it selects.
 
+## Claude workflow: the Claude desktop app on the Router
+
+Court also sets up a second copy of the Claude desktop app, **Claude (Gateway)**, in
+gateway mode on the same Router. Its model menu holds your Claude, Codex and OpenCode Go
+models, and it can run Claude Code sessions on another machine over SSH. Your normal
+Claude app is not changed.
+
+```sh
+court claude relay install   # web search relay, starts at login
+court claude app             # creates /Applications/Claude (Gateway).app
+court claude config          # builds the config from the Router's models
+```
+
+See [docs/claude-desktop.md](docs/claude-desktop.md) for the Router config it needs,
+the settings file and the rules the desktop app imposes.
+
 ## Configuration
 
 Court uses these defaults:
